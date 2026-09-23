@@ -1,0 +1,42 @@
+<launch>
+  <!-- Automated AEDE Garage substrate: same vehicle, terrain analysis,
+       scan synchronization and controller as system_garage.launch, without
+       joystick, RViz or visualization-only nodes. -->
+  <arg name="vehicleHeight" default="0.75"/>
+  <arg name="vehicleX" default="0.0"/>
+  <arg name="vehicleY" default="0.0"/>
+  <arg name="terrainZ" default="0.0"/>
+  <arg name="vehicleYaw" default="0.0"/>
+  <arg name="maxSpeed" default="2.0"/>
+  <arg name="autonomySpeed" default="2.0"/>
+  <arg name="seed" default="0"/>
+  <arg name="planner_param_file" default="$(find flex_e_planner)/config/exploration_garage.yaml"/>
+  <arg name="decision_trace_path" default=""/>
+
+  <include file="$(find local_planner)/launch/local_planner.launch">
+    <arg name="maxSpeed" value="$(arg maxSpeed)"/>
+    <arg name="autonomySpeed" value="$(arg autonomySpeed)"/>
+    <arg name="goalX" value="$(arg vehicleX)"/>
+    <arg name="goalY" value="$(arg vehicleY)"/>
+  </include>
+  <include file="$(find terrain_analysis)/launch/terrain_analysis.launch"/>
+  <include file="$(find terrain_analysis_ext)/launch/terrain_analysis_ext.launch">
+    <arg name="checkTerrainConn" value="true"/>
+  </include>
+  <include file="$(find vehicle_simulator)/launch/vehicle_simulator.launch">
+    <arg name="world_name" value="garage"/>
+    <arg name="vehicleHeight" value="$(arg vehicleHeight)"/>
+    <arg name="vehicleX" value="$(arg vehicleX)"/>
+    <arg name="vehicleY" value="$(arg vehicleY)"/>
+    <arg name="terrainZ" value="$(arg terrainZ)"/>
+    <arg name="vehicleYaw" value="$(arg vehicleYaw)"/>
+    <arg name="gui" value="false"/>
+    <arg name="headless" value="true"/>
+  </include>
+  <include file="$(find sensor_scan_generation)/launch/sensor_scan_generation.launch"/>
+  <include file="$(find flex_e_planner)/launch/explore_garage.launch">
+    <arg name="planner_param_file" value="$(arg planner_param_file)"/>
+    <arg name="seed" value="$(arg seed)"/>
+    <arg name="decision_trace_path" value="$(arg decision_trace_path)"/>
+  </include>
+</launch>

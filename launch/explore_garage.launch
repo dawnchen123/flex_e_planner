@@ -1,0 +1,25 @@
+<launch>
+  <!-- Mirrors dsvp_launch/explore_garage.launch: it attaches a planner to an
+       already-running AEDE Garage system and owns no simulator/controller. -->
+  <arg name="enable_bag_record" default="false"/>
+  <arg name="bag_name" default="flex_e_garage"/>
+  <arg name="simulation" default="true"/>
+  <arg name="use_boundary" default="false"/>
+  <arg name="planner_param_file" default="$(find flex_e_planner)/config/exploration_garage.yaml"/>
+  <arg name="seed" default="0"/>
+  <arg name="decision_trace_path" default=""/>
+
+  <!-- The config is node-private so it cannot overwrite DSV global params
+       when both packages are installed in this workspace. -->
+  <node name="flex_e_planner" pkg="flex_e_planner" type="flex_e_planner.py" output="screen" required="true">
+    <rosparam command="load" file="$(arg planner_param_file)"/>
+    <param name="seed" value="$(arg seed)"/>
+    <param name="decision_trace_path" value="$(arg decision_trace_path)"/>
+  </node>
+
+  <group if="$(arg enable_bag_record)">
+    <include file="$(find flex_e_planner)/launch/rosbag_record.launch">
+      <arg name="bag_name" value="$(arg bag_name)"/>
+    </include>
+  </group>
+</launch>

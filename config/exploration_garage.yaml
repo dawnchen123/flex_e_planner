@@ -1,0 +1,66 @@
+# FLEX-E configuration for the official AEDE Garage simulator.
+# The topic names intentionally match dsvp_launch/config/exploration_garage.yaml
+# so either planner can be attached to the same AEDE system_garage.launch.
+
+# AEDE public data/control contract.
+terrain_topic: /terrain_map_ext
+state_estimation_topic: /state_estimation
+waypoint_topic: /way_point
+runtime_topic: /runtime
+exploration_finish_topic: /exploration_finish
+stop_exploring_topic: /stop_exploring
+frame_id: map
+
+# Multi-level observed-support graph.
+grid_resolution_m: 0.50
+z_resolution_m: 0.25
+max_slope_deg: 20.0
+max_step_m: 0.25
+safe_intensity_m: 0.15
+vehicle_height_m: 0.75
+max_graph_cells: 160000
+max_search_nodes: 5000
+frontier_search_range_m: 25.0
+# Only after the local search fails, search the retained observed graph for a
+# distant frontier that is connected by known traversable support.
+global_frontier_search_range_m: 120.0
+global_max_search_nodes: 30000
+
+# Closed-loop target selection.  Goals are only observed support cells and
+# are forwarded directly to AEDE's existing localPlanner/pathFollower.
+planner_period_s: 0.25
+# A frontier is a persistent exploration target; the shorter execution horizon
+# below is only the rolling local-controller subgoal.
+minimum_goal_distance_m: 8.0
+visited_radius_m: 3.0
+visited_vertical_tolerance_m: 0.75
+visit_sample_distance_m: 0.75
+execution_horizon_m: 4.0
+frontier_standoff_m: 2.5
+max_frontier_gain: 3
+min_frontier_support_neighbors: 3
+global_goal_reached_m: 1.25
+rejected_goal_radius_m: 4.0
+rejected_goal_memory_s: 7200.0
+blocked_subgoal_radius_m: 2.0
+blocked_subgoal_memory_s: 300.0
+frontier_distance_reward: 0.08
+frontier_heading_reward: 3.0
+active_goal_min_hold_s: 2.0
+active_goal_reached_m: 0.90
+active_goal_stall_s: 8.0
+active_goal_timeout_s: 18.0
+progress_epsilon_m: 0.25
+
+# Completion and low-overhead retry/trace policy.
+frontier_retry_period_s: 2.0
+no_frontier_finish_s: 120.0
+minimum_exploration_s: 120.0
+max_exploration_s: 3600.0
+shutdown_on_finish: false
+finish_shutdown_delay_s: 2.0
+trace_idle_period_s: 2.0
+seed: 0
+
+# Optional append-only diagnostics; empty disables file output.
+decision_trace_path: ""

@@ -1,0 +1,28 @@
+<launch>
+  <!-- Convenience form: AEDE Garage system first, then FLEX-E.  For a fair
+       DSV comparison, use the two separate launch commands instead. -->
+  <arg name="gazebo_gui" default="false"/>
+  <arg name="vehicleX" default="0.0"/>
+  <arg name="vehicleY" default="0.0"/>
+  <arg name="terrainZ" default="0.0"/>
+  <arg name="vehicleYaw" default="0.0"/>
+  <arg name="vehicleHeight" default="0.75"/>
+  <arg name="seed" default="0"/>
+  <arg name="planner_param_file" default="$(find flex_e_planner)/config/exploration_garage.yaml"/>
+  <arg name="decision_trace_path" default=""/>
+
+  <include file="$(find vehicle_simulator)/launch/system_garage.launch">
+    <arg name="gazebo_gui" value="$(arg gazebo_gui)"/>
+    <arg name="vehicleX" value="$(arg vehicleX)"/>
+    <arg name="vehicleY" value="$(arg vehicleY)"/>
+    <arg name="terrainZ" value="$(arg terrainZ)"/>
+    <arg name="vehicleYaw" value="$(arg vehicleYaw)"/>
+    <arg name="vehicleHeight" value="$(arg vehicleHeight)"/>
+  </include>
+
+  <include file="$(find flex_e_planner)/launch/explore_garage.launch">
+    <arg name="planner_param_file" value="$(arg planner_param_file)"/>
+    <arg name="seed" value="$(arg seed)"/>
+    <arg name="decision_trace_path" value="$(arg decision_trace_path)"/>
+  </include>
+</launch>
