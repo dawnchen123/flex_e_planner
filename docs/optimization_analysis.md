@@ -60,3 +60,35 @@ run.  A second validation after viewpoint-novelty filtering produced 9 new-goal
 searches averaging 31.8 ms with a 43.2 ms maximum.  These short runs validate
 the code path and latency improvement; the next full Garage run is needed to
 measure final coverage, completion time, and long-run stall fraction.
+
+## Reachable-space evaluator revision
+
+The retained version above still equated a missing terrain neighbor with
+unknown space. That cannot distinguish an unexplored doorway from a wall, an
+observed drop, or an unsupported region already traversed by lidar rays. It
+also retired a frontier immediately on arrival and treated prolonged candidate
+absence as completion.
+
+The current implementation adds an independent `flex_e_core.space_evaluator`
+module. Synchronized `/registered_scan` and `/state_estimation_at_scan` inputs
+are raycast into a bounded sparse 3-D evidence map: ray interiors are free,
+returns are occupied, and untouched voxels remain unknown. Terrain remains the
+source of traversability. A true frontier is a reachable support boundary with
+enough unknown clearance columns, no inflated occupied column in its short
+corridor, and a clear line of sight from a reachable safe viewpoint.
+
+The unknown-space anchor and controller waypoint are deliberately separate.
+The anchor supplies information gain and exploration direction; `/way_point`
+is always placed on observed slope/step-connected terrain. After arrival the
+planner waits for a new scan, measures newly observed support and residual
+unknown space, then writes a fixed position/elevation/direction completion
+mask. No persistent cluster identity is used.
+
+Completion is now a topological audit of the reachable component rather than a
+timer alone. The planner refuses to finish if an unresolved true-frontier
+region exists, the global graph search is truncated, too few cells are
+reachable, or the map is still changing. It publishes closure only after
+several stable untruncated audits. Synthetic checks cover wall rejection,
+observed-drop rejection, open-unknown acceptance, ray updates, multi-level
+direction masks, safe-viewpoint selection, and truncated-search handling. A
+full Garage run remains necessary for final coverage and timing measurements.
