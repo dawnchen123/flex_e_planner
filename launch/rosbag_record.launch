@@ -2,5 +2,5 @@
   <!-- Same opt-in recording convention as dsvp_launch/rosbag_record.launch. -->
   <arg name="bag_name" default="garage"/>
   <node pkg="rosbag" type="record" name="rosbag_record_flex_e"
-        args="record -o $(env HOME)/Desktop/simulation_bags/flex_e/$(arg bag_name)/ /tf /registered_scan /state_estimation /state_estimation_at_scan /sensor_scan /terrain_map /terrain_map_ext /way_point /path /cmd_vel /runtime /exploration_finish /stop_exploring /flex_e/exploration_closed /flex_e/true_frontiers /flex_e/safe_viewpoints"/>
+        args="record -o $(env HOME)/Desktop/simulation_bags/flex_e/$(arg bag_name)/ /tf /registered_scan /state_estimation /state_estimation_at_scan /sensor_scan /terrain_map /terrain_map_ext /way_point /path /cmd_vel /runtime /exploration_finish /stop_exploring /flex_e/exploration_closed /flex_e/true_frontiers /flex_e/safe_viewpoints /flex_e/unexplored_regions"/>
 </launch>

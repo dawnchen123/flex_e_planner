@@ -16,6 +16,7 @@ catkin_package()
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_space_evaluator.py)
+  catkin_add_nosetests(test/test_region_coverage.py)
 endif()
 
 catkin_install_python(PROGRAMS

@@ -52,6 +52,11 @@ class ExplorationSpaceEvaluator(object):
         max_voxels=400000,
         completed_resolution_m=1.0,
         completed_vertical_tolerance_m=0.75,
+        support_coverage_resolution_m=0.5,
+        support_coverage_range_m=12.0,
+        support_coverage_max_cells=200000,
+        support_coverage_min_known_fraction=0.65,
+        clearance_search_m=3.0,
     ):
         self.resolution_m = max(0.1, float(resolution_m))
         self.ray_step_m = max(0.1, float(ray_step_m))
@@ -75,6 +80,20 @@ class ExplorationSpaceEvaluator(object):
         self.completed_vertical_tolerance_m = max(
             self.resolution_m, float(completed_vertical_tolerance_m)
         )
+        self.support_coverage_resolution_m = max(
+            self.resolution_m, float(support_coverage_resolution_m)
+        )
+        self.support_coverage_range_m = max(
+            self.support_coverage_resolution_m, float(support_coverage_range_m)
+        )
+        self.support_coverage_max_cells = max(1000, int(support_coverage_max_cells))
+        self.support_coverage_min_known_fraction = min(
+            1.0, max(0.0, float(support_coverage_min_known_fraction))
+        )
+        self.clearance_search_m = max(
+            self.obstacle_inflation_m + self.resolution_m,
+            float(clearance_search_m),
+        )
 
         # Negative evidence is free; positive evidence is occupied.  Evidence
         # is bounded so a transient return can later be corrected by visibility.
@@ -82,7 +101,14 @@ class ExplorationSpaceEvaluator(object):
         self.completed_regions = set()
         self.revision = 0
         self.completed_revision = 0
+        # Coverage belongs to traversable support, not obstacle surfaces. A
+        # support cell is persistent once a registered scan origin has a
+        # robot-clear line of sight to it. Completed space can still be used
+        # for transit, but it no longer attracts an information waypoint.
+        self.covered_support = set()
+        self.coverage_revision = 0
         self._column_cache = {}
+        self._clearance_cache = {}
 
     @staticmethod
     def _round_cell(value, resolution):
@@ -144,21 +170,197 @@ class ExplorationSpaceEvaluator(object):
         if free_updates or occupied_updates:
             self.revision += 1
             self._column_cache.clear()
+            self._clearance_cache.clear()
         return len(xyz)
 
-    def column_state(self, x, y, ground_z):
+    def _support_key(self, x, y, z):
+        resolution = self.support_coverage_resolution_m
+        return tuple(self._round_cell(value, resolution) for value in (x, y, z))
+
+    def support_key(self, x, y, z):
+        return self._support_key(x, y, z)
+
+    def is_support_key_covered(self, key):
+        return tuple(key) in self.covered_support
+
+    def is_support_covered(self, x, y, z):
+        return self._support_key(x, y, z) in self.covered_support
+
+    def has_clear_support_line(
+        self,
+        sensor_position,
+        support_position,
+        sensor_height_m,
+        minimum_known_fraction=0.0,
+    ):
+        """Return whether an inflated robot column can see a support cell.
+
+        The ray follows the sensor-height profile above the terrain rather
+        than tracing toward the ground return. Unknown columns are allowed:
+        the registered scan is the observation that turns visible traversable
+        support into covered space. Inflated occupied columns still occlude it.
+        """
+
+        sensor = np.asarray(sensor_position, dtype=np.float64).reshape(3)
+        support = np.asarray(support_position, dtype=np.float64).reshape(3)
+        target = support.copy()
+        target[2] += float(sensor_height_m)
+        distance = float(np.linalg.norm(target - sensor))
+        if distance > self.support_coverage_range_m:
+            return False
+        if distance <= self.resolution_m:
+            return True
+        steps = max(1, int(math.ceil(distance / self.resolution_m)))
+        known_columns = 0
+        checked_columns = 0
+        for step in range(1, steps):
+            ratio = float(step) / steps
+            sample = sensor + ratio * (target - sensor)
+            ground_z = sample[2] - float(sensor_height_m)
+            state = self.column_state(sample[0], sample[1], ground_z)
+            checked_columns += 1
+            if state == OCCUPIED:
+                return False
+            if state == FREE:
+                known_columns += 1
+        known_fraction = (
+            float(known_columns) / checked_columns if checked_columns else 1.0
+        )
+        return known_fraction >= float(minimum_known_fraction)
+
+    def observe_support_cells(self, sensor_position, support_points, sensor_height_m):
+        """Persist support cells covered by one effective registered scan."""
+
+        before = len(self.covered_support)
+        for point in support_points:
+            x, y, z = (float(value) for value in point)
+            if self.column_state(x, y, z) == OCCUPIED:
+                continue
+            if self.has_clear_support_line(
+                sensor_position,
+                (x, y, z),
+                sensor_height_m,
+                self.support_coverage_min_known_fraction,
+            ):
+                self.covered_support.add(self._support_key(x, y, z))
+        if len(self.covered_support) > self.support_coverage_max_cells:
+            # Dict-like insertion order is unavailable for a set. Coverage is
+            # deliberately bounded with a deterministic spatial ordering.
+            keep = sorted(self.covered_support)[-self.support_coverage_max_cells :]
+            self.covered_support = set(keep)
+        added = len(self.covered_support) - before
+        if added > 0:
+            self.coverage_revision += 1
+        return max(0, added)
+
+    def support_visibility_gain(
+        self,
+        support_position,
+        uncovered_points,
+        sensor_height_m,
+        max_checks=256,
+        minimum_known_fraction=0.0,
+    ):
+        """Count uncovered traversable cells visible from a safe viewpoint."""
+
+        return len(
+            self.support_visibility_keys(
+                support_position,
+                uncovered_points,
+                sensor_height_m,
+                max_checks,
+                minimum_known_fraction,
+            )
+        )
+
+    def support_visibility_keys(
+        self,
+        support_position,
+        uncovered_points,
+        sensor_height_m,
+        max_checks=256,
+        minimum_known_fraction=0.0,
+    ):
+        """Return the exact support-key set used for predicted coverage gain."""
+
+        points = list(uncovered_points)[: max(1, int(max_checks))]
+        sensor = (
+            float(support_position[0]),
+            float(support_position[1]),
+            float(support_position[2]) + float(sensor_height_m),
+        )
+        visible = []
+        for point in points:
+            key = self._support_key(*point)
+            if key in self.covered_support:
+                continue
+            if self.has_clear_support_line(
+                sensor,
+                point,
+                sensor_height_m,
+                minimum_known_fraction,
+            ):
+                visible.append(key)
+        return tuple(visible)
+
+    def obstacle_clearance(self, x, y, ground_z, max_distance_m=None):
+        """Distance from a support cell to the nearest observed obstacle."""
+
+        max_distance_m = (
+            self.clearance_search_m
+            if max_distance_m is None
+            else max(self.resolution_m, float(max_distance_m))
+        )
+        cache_key = (
+            self._round_cell(x, self.resolution_m),
+            self._round_cell(y, self.resolution_m),
+            self._round_cell(ground_z, self.resolution_m),
+            int(math.ceil(max_distance_m / self.resolution_m)),
+        )
+        cached = self._clearance_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        ix, iy, ground_iz, radius_cells = cache_key
+        min_dz = max(1, int(math.ceil(self.min_clearance_m / self.resolution_m)))
+        max_dz = max(min_dz, int(math.ceil(self.max_clearance_m / self.resolution_m)))
+        best = max_distance_m
+        for ox in range(-radius_cells, radius_cells + 1):
+            for oy in range(-radius_cells, radius_cells + 1):
+                distance = math.hypot(ox, oy) * self.resolution_m
+                if distance >= best or distance > max_distance_m:
+                    continue
+                if any(
+                    self.evidence.get((ix + ox, iy + oy, ground_iz + dz), 0)
+                    >= self.occupied_threshold
+                    for dz in range(min_dz, max_dz + 1)
+                ):
+                    best = max(0.0, distance - 0.5 * self.resolution_m)
+        self._clearance_cache[cache_key] = best
+        return best
+
+    def column_state(self, x, y, ground_z, inflation_m=None):
         """Classify the robot-clearance column above a terrain support cell."""
 
         resolution = self.resolution_m
+        inflation_m = (
+            self.obstacle_inflation_m
+            if inflation_m is None
+            else max(0.0, float(inflation_m))
+        )
         ix = self._round_cell(x, resolution)
         iy = self._round_cell(y, resolution)
         ground_iz = self._round_cell(ground_z, resolution)
-        cache_key = (ix, iy, ground_iz)
+        cache_key = (
+            ix,
+            iy,
+            ground_iz,
+            self._round_cell(inflation_m, 0.01),
+        )
         cached = self._column_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        inflation_cells = int(math.ceil(self.obstacle_inflation_m / resolution))
+        inflation_cells = int(math.ceil(inflation_m / resolution))
         # Never query the ground voxel itself: a valid floor return is occupied
         # in the ray map but must not be interpreted as a wall.
         min_dz = max(1, int(math.ceil(self.min_clearance_m / resolution)))
@@ -169,7 +371,15 @@ class ExplorationSpaceEvaluator(object):
                 observed_free = True
             for ox in range(-inflation_cells, inflation_cells + 1):
                 for oy in range(-inflation_cells, inflation_cells + 1):
-                    if math.hypot(ox * resolution, oy * resolution) > self.obstacle_inflation_m:
+                    # Occupancy keys represent finite voxels, not point
+                    # obstacles.  Account for half a voxel when comparing the
+                    # obstacle-center distance with the requested footprint;
+                    # otherwise a 0.45 m footprint on a 0.5 m grid would have
+                    # no lateral inflation at all.
+                    if (
+                        math.hypot(ox * resolution, oy * resolution)
+                        > inflation_m + 0.5 * resolution
+                    ):
                         continue
                     if (
                         self.evidence.get((ix + ox, iy + oy, iz), 0)
@@ -182,7 +392,7 @@ class ExplorationSpaceEvaluator(object):
         return state
 
     def direction_evidence(self, x, y, ground_z, dx, dy, terrain_resolution_m):
-        """Return true-frontier evidence along one cardinal terrain direction.
+        """Return true-frontier evidence along a cardinal or diagonal direction.
 
         Any inflated obstacle in the look-ahead corridor closes this boundary.
         A fully observed free corridor without terrain support is an observed
@@ -190,13 +400,17 @@ class ExplorationSpaceEvaluator(object):
         """
 
         terrain_resolution_m = max(self.resolution_m, float(terrain_resolution_m))
+        direction_norm = math.hypot(dx, dy)
+        if direction_norm <= 1.0e-9:
+            return DirectionEvidence(False, 0, 0)
+        unit_x, unit_y = float(dx) / direction_norm, float(dy) / direction_norm
         steps = max(1, int(math.ceil(self.frontier_lookahead_m / terrain_resolution_m)))
         center_states = []
         occupied_columns = 0
         for step in range(1, steps + 1):
             state = self.column_state(
-                x + dx * step * terrain_resolution_m,
-                y + dy * step * terrain_resolution_m,
+                x + unit_x * step * terrain_resolution_m,
+                y + unit_y * step * terrain_resolution_m,
                 ground_z,
             )
             center_states.append(state)
@@ -214,10 +428,10 @@ class ExplorationSpaceEvaluator(object):
         lateral_steps = int(math.ceil(self.frontier_lateral_m / terrain_resolution_m))
         unknown_columns = 0
         occupied_fan = 0
-        perpendicular_x, perpendicular_y = -dy, dx
+        perpendicular_x, perpendicular_y = -unit_y, unit_x
         for step in range(1, steps + 1):
-            center_x = x + dx * step * terrain_resolution_m
-            center_y = y + dy * step * terrain_resolution_m
+            center_x = x + unit_x * step * terrain_resolution_m
+            center_y = y + unit_y * step * terrain_resolution_m
             for lateral in range(-lateral_steps, lateral_steps + 1):
                 state = self.column_state(
                     center_x + perpendicular_x * lateral * terrain_resolution_m,
@@ -234,7 +448,7 @@ class ExplorationSpaceEvaluator(object):
             occupied_fan,
         )
 
-    def has_clear_line_of_sight(self, start, end):
+    def has_clear_line_of_sight(self, start, end, inflation_m=None):
         """Check the inflated robot-clearance columns between two viewpoints."""
 
         start = np.asarray(start, dtype=np.float64).reshape(3)
@@ -246,7 +460,12 @@ class ExplorationSpaceEvaluator(object):
         for step in range(1, steps):
             ratio = float(step) / steps
             point = start + ratio * (end - start)
-            if self.column_state(point[0], point[1], point[2]) == OCCUPIED:
+            if (
+                self.column_state(
+                    point[0], point[1], point[2], inflation_m
+                )
+                == OCCUPIED
+            ):
                 return False
         return True
 

@@ -39,18 +39,19 @@ visited_radius_m: 1.0
 visited_vertical_tolerance_m: 0.50
 visited_penalty: 1.0
 visit_sample_distance_m: 0.75
-execution_horizon_m: 4.0
+execution_horizon_m: 5.0
 frontier_standoff_m: 1.5
-max_frontier_gain: 4
-min_frontier_support_neighbors: 3
-global_goal_reached_m: 1.25
+max_frontier_gain: 8
+min_frontier_support_neighbors: 2
+completed_reopen_unknown_columns: 6
+global_goal_reached_m: 1.5
 blocked_subgoal_radius_m: 0.75
 blocked_subgoal_memory_s: 60.0
 # Path length is a cost. Heading is only a weak tie breaker.
 frontier_distance_reward: -0.05
 frontier_heading_reward: 0.30
 active_goal_min_hold_s: 2.0
-active_goal_reached_m: 0.90
+active_goal_reached_m: 1.20
 active_goal_stall_s: 12.0
 active_goal_timeout_s: 30.0
 progress_epsilon_m: 0.25
@@ -60,7 +61,7 @@ progress_epsilon_m: 0.25
 frontier_cluster_link_m: 1.0
 frontier_cluster_vertical_tolerance_m: 0.75
 frontier_cluster_gain_reward: 0.20
-frontier_observation_wait_s: 2.0
+frontier_observation_wait_s: 0.5
 frontier_progress_radius_m: 3.0
 frontier_min_growth_cells: 20
 map_growth_min_cells: 5
@@ -75,9 +76,17 @@ occupancy_max_rays: 900
 occupancy_occupied_threshold: 2
 occupancy_free_threshold: -1
 occupancy_obstacle_inflation_m: 0.60
+# Hard graph traversal footprint. AEDE local_planner uses a 0.6 x 0.6 m
+# envelope, whose turning circumradius is 0.424 m; 0.45 m retains a small
+# safety margin without disconnecting valid garage doorways. Goal stopping
+# clearance below is intentionally larger.
+hard_traversal_clearance_m: 0.45
 occupancy_min_clearance_m: 0.30
 occupancy_max_clearance_m: 1.60
-occupancy_max_voxels: 400000
+# The previous 400k cap was reached during the Garage run and started evicting
+# old visibility evidence, turning known corridors back into UNKNOWN. Keep a
+# full-garage budget so physical completion remains stable.
+occupancy_max_voxels: 1200000
 visibility_update_period_s: 0.50
 visibility_min_voxels: 100
 occupancy_growth_min_voxels: 20
@@ -87,6 +96,54 @@ occupancy_growth_min_voxels: 20
 frontier_lookahead_m: 4.0
 frontier_lateral_m: 1.0
 frontier_min_unknown_columns: 3
+
+# TARE-style region coverage layer. Frontier clusters remain transient, while
+# completion and retry state are attached to fixed XYZ subspaces. Completion
+# uses visible traversable support plus real frontiers; obstacle surfaces never
+# become exploration goals.
+region_size_m: 8.0
+region_height_m: 3.0
+region_open_frontier_points: 1
+region_close_frontier_points: 1
+region_reopen_frontier_points: 1
+region_coverage_complete_ratio: 0.92
+region_coverage_min_uncovered_cells: 6
+region_reopen_new_cells: 12
+region_close_audits: 2
+region_reopen_audits: 2
+region_unselectable_close_audits: 2
+region_blocked_frontier_audits: 5
+region_orphan_close_audits: 3
+region_defer_retry_s: 15.0
+region_max_failures: 3
+
+# Free-space coverage and interior viewpoints. A registered scan covers every
+# support cell that lies within range and has an inflated-column line of sight.
+# Incomplete regions are viewed from high-clearance interior cells, not walls.
+support_coverage_resolution_m: 0.50
+support_coverage_range_m: 12.0
+support_coverage_max_cells: 200000
+support_coverage_min_known_fraction: 0.65
+coverage_max_points_per_region: 256
+coverage_candidate_limit: 32
+coverage_min_viewpoint_gain: 6
+coverage_min_observation_gain: 4
+# Predicted cleanup gain must already have partial free-space support. This
+# removes the repeated predicted-gain/actual-zero trips seen in the trace.
+coverage_prediction_min_known_fraction: 0.35
+coverage_gain_reward: 2.0
+clearance_search_m: 3.0
+minimum_waypoint_clearance_m: 0.75
+# Expansion points inside valid corridors may use a smaller stopping margin;
+# it remains above the 0.45 m hard vehicle-footprint constraint.
+minimum_frontier_waypoint_clearance_m: 0.55
+waypoint_clearance_reward: 1.25
+
+# When the selected region lies outside the current closed subspace, advance
+# through its graph boundary and command a safe point beyond the threshold.
+# Occupancy inflation remains the hard minimum passage-width constraint.
+portal_exit_distance_m: 1.5
+portal_exit_search_m: 10.0
 
 # Layer- and direction-aware physical completion mask.
 completed_region_resolution_m: 1.0

@@ -21,6 +21,43 @@ or drop. The information target may lie in unknown space, but every executable
 `/way_point` remains a safe observed support cell. `localPlanner` and
 `pathFollower` remain the only AEDE components that generate `/cmd_vel`.
 
+The planner also keeps a TARE-style coverage layer. A registered scan marks
+every robot-visible traversable support cell inside
+`support_coverage_range_m` as covered. Obstacle returns are used to close and
+occlude boundaries, but are never exploration goals. Incomplete subspaces use
+high-clearance interior viewpoints that maximize new free-space coverage.
+Subspaces retain `UNSEEN`, `EXPLORING`, `COVERED`, retryable `DEFERRED`, and
+bounded `INACCESSIBLE` states. A covered subspace is reopened by either a
+stable feasible frontier or sufficient new traversable graph growth. Coverage
+progress compares the exact predicted support-key set before and after an
+observation, so a changing regional denominator cannot create false negative
+gain.
+
+Target scheduling is expansion-first: local, global, and full reachable
+searches look for executable real frontiers before any interior coverage
+cleanup is allowed to run. This prevents nearby low-value cleanup targets from
+hiding a distant doorway. Cleanup visibility also requires partial existing
+free-space evidence, reducing predicted-gain/actual-zero trips.
+
+An `OPEN` region is not allowed to survive forever without a selectable goal.
+Frontier-free residuals with no informative interior view become `COVERED`;
+raw frontiers with no footprint-safe viewpoint become `INACCESSIBLE` after a
+bounded audit. Unresolved regions outside the complete reachable component
+use the same bounded audit before being excluded from closure.
+
+The inflated occupancy columns are also applied to graph reachability, so a
+passage narrower than the configured vehicle footprint is rejected. When a
+route leaves the current closed subspace, the rolling waypoint is advanced to
+a high-clearance cell beyond the subspace boundary instead of stopping on the
+door threshold. Covered space remains available for transit but cannot create
+another information target.
+`hard_traversal_clearance_m` controls graph connectivity.  The garage value is
+`0.45 m`, derived from AEDE local planner's `0.6 x 0.6 m` envelope (turning
+circumradius `0.424 m`) plus a small margin. Corridor expansion points use
+`minimum_frontier_waypoint_clearance_m=0.55 m`; ordinary stopping/cleanup uses
+the larger `minimum_waypoint_clearance_m=0.75 m`. Thus a body-width-safe
+corridor remains explorable without relaxing the hard passage constraint.
+
 ## Build
 
 ```bash
@@ -96,12 +133,24 @@ roslaunch flex_e_planner explore_garage.launch \
 The most important physical/planning parameters are `vehicle_height_m`,
 `max_slope_deg`, `max_step_m`, `grid_resolution_m`, `occupancy_resolution_m`,
 `frontier_lookahead_m`, `minimum_goal_distance_m`, and `execution_horizon_m`.
+A second tuning group controls region coverage: `region_size_m`,
+`region_close_audits`, `region_reopen_audits`, `region_defer_retry_s`,
+`support_coverage_range_m`, `region_coverage_complete_ratio`,
+`coverage_min_viewpoint_gain`, `minimum_waypoint_clearance_m`, and
+`portal_exit_distance_m`. `support_coverage_min_known_fraction` prevents a
+geometrically clear but unobserved ray from falsely covering terrain, while
+`coverage_prediction_min_known_fraction` filters overly optimistic cleanup
+views. The Garage occupancy budget is sized to preserve global evidence;
+reaching `occupancy_max_voxels` means the value should be increased rather
+than allowing old corridors to become unknown again.
 A selected safe viewpoint is kept as a global goal while
 `execution_horizon_m` controls its rolling controller subgoal. Reaching it
 starts an observation interval. The old point-based rejected-goal list has
 been replaced by a fixed position/elevation/direction completion mask: a
-no-information or failed region is closed once, while a genuinely advancing
-boundary remains eligible farther outward.
+confirmed closed or advancing boundary retires only the observed anchor. A
+stalled/no-information attempt instead enters `DEFERRED`; after repeated
+failures only the small failed anchor is quarantined, never the whole physical
+subspace.
 
 Keep the AEDE topic names unchanged unless the entire simulator and both
 comparison planners are remapped consistently.
@@ -123,18 +172,25 @@ rostopic echo -n 1 /flex_e/exploration_closed
 
 Expected ownership: AEDE publishes the four input topics, FLEX-E publishes
 `/way_point`, `/runtime`, `/flex_e/true_frontiers`,
-`/flex_e/safe_viewpoints`, and `/flex_e/exploration_closed`; AEDE's
+`/flex_e/safe_viewpoints`, `/flex_e/unexplored_regions`, and
+`/flex_e/exploration_closed`; AEDE's
 `pathFollower` publishes `/cmd_vel`.
 RViz may also advertise `/way_point` for its manual Waypoint tool; that is
 normal.  The DSV `/exploration` node must not be listed as a publisher during a
 FLEX-E run.
 
-The decision trace should contain `new_*_true_frontier_*` followed by one or
-more `continued_global_frontier` rows. It also records occupancy voxels,
+The decision trace contains `new_*_true_frontier_*` or
+`new_*_interior_coverage_*` followed by one or more matching
+`continued_global_*` rows. It also records occupancy voxels,
 physical completion-mask cells, information gain, reachable cells, transient
 frontier regions, closure state and whether the global search was truncated.
 Use `/flex_e/true_frontiers` and `/flex_e/safe_viewpoints` as RViz PointCloud2
 displays when tuning the evaluator.
+`/flex_e/unexplored_regions` publishes subspace centers with intensity 1 for
+`EXPLORING`, 2 for `DEFERRED`, 3 for `COVERED`, and 4 for `INACCESSIBLE`.
+The decision trace also records uncovered support cells, the selected region's
+coverage ratio, reachable inaccessible/orphaned region counts, target type,
+and the number of subspaces in the current coarse route.
 
 The optimized Garage defaults publish latched `true` messages on
 `/exploration_finish` and `/stop_exploring` only after an untruncated global

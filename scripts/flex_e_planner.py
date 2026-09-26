@@ -3,8 +3,9 @@
 
 The planner receives AEDE's public terrain, registered lidar and truth-pose
 topics. It never loads the Garage mesh or an offline point cloud. Information
-targets lie on real free/unknown boundaries; every executable target remains
-an observed, support-connected surface cell published on ``/way_point``.
+targets lie on real free/unknown boundaries or high-clearance interior
+viewpoints; every executable target remains an observed, support-connected
+terrain cell published on ``/way_point``.
 """
 
 from __future__ import print_function
@@ -21,7 +22,14 @@ from collections import defaultdict
 import message_filters
 import numpy as np
 import rospy
-from flex_e_core.space_evaluator import ExplorationSpaceEvaluator
+from flex_e_core.region_coverage import (
+    COVERED,
+    DEFERRED,
+    EXPLORING,
+    INACCESSIBLE,
+    RegionCoverageTracker,
+)
+from flex_e_core.space_evaluator import OCCUPIED, ExplorationSpaceEvaluator
 from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs import point_cloud2
@@ -106,6 +114,9 @@ class FlexEPlanner(object):
         self.frontier_standoff_m = max(0.0, float(param("frontier_standoff_m", 2.0)))
         self.max_frontier_gain = max(1, int(param("max_frontier_gain", 2)))
         self.min_frontier_support = max(1, int(param("min_frontier_support_neighbors", 3)))
+        self.completed_reopen_unknown_columns = max(
+            1, int(param("completed_reopen_unknown_columns", 6))
+        )
         self.frontier_cluster_link_m = max(
             self.grid_m, float(param("frontier_cluster_link_m", 1.0))
         )
@@ -169,6 +180,55 @@ class FlexEPlanner(object):
         self.rng = random.Random(int(param("seed", 0)))
         self.trace_path = str(param("decision_trace_path", "")).strip()
 
+        # TARE-style coarse physical subspaces. These states are independent
+        # of transient frontier cluster IDs and use hysteresis to prevent a
+        # weak observation from repeatedly opening and closing a region.
+        self.region_size_m = max(2.0, float(param("region_size_m", 8.0)))
+        self.region_height_m = max(0.5, float(param("region_height_m", 3.0)))
+        self.coverage_max_points_per_region = max(
+            32, int(param("coverage_max_points_per_region", 256))
+        )
+        self.coverage_candidate_limit = max(
+            4, int(param("coverage_candidate_limit", 32))
+        )
+        self.coverage_min_viewpoint_gain = max(
+            1, int(param("coverage_min_viewpoint_gain", 6))
+        )
+        self.coverage_min_observation_gain = max(
+            1, int(param("coverage_min_observation_gain", 4))
+        )
+        self.coverage_prediction_min_known_fraction = min(
+            1.0,
+            max(
+                0.0,
+                float(param("coverage_prediction_min_known_fraction", 0.35)),
+            ),
+        )
+        self.coverage_gain_reward = max(
+            0.0, float(param("coverage_gain_reward", 2.0))
+        )
+        self.clearance_reward = max(
+            0.0, float(param("waypoint_clearance_reward", 1.25))
+        )
+        self.minimum_waypoint_clearance_m = max(
+            self.grid_m,
+            float(param("minimum_waypoint_clearance_m", 0.75)),
+        )
+        self.hard_traversal_clearance_m = max(
+            0.0, float(param("hard_traversal_clearance_m", 0.45))
+        )
+        self.minimum_frontier_waypoint_clearance_m = max(
+            self.hard_traversal_clearance_m,
+            float(param("minimum_frontier_waypoint_clearance_m", 0.55)),
+        )
+        self.portal_exit_distance_m = max(
+            self.grid_m, float(param("portal_exit_distance_m", 1.5))
+        )
+        self.portal_exit_search_m = max(
+            self.portal_exit_distance_m,
+            float(param("portal_exit_search_m", 10.0)),
+        )
+
         self.visibility_update_period_s = max(
             0.1, float(param("visibility_update_period_s", 0.5))
         )
@@ -202,11 +262,45 @@ class FlexEPlanner(object):
             frontier_lookahead_m=param("frontier_lookahead_m", 4.0),
             frontier_lateral_m=param("frontier_lateral_m", 1.0),
             frontier_min_unknown_columns=param("frontier_min_unknown_columns", 3),
-            max_voxels=param("occupancy_max_voxels", 400000),
+            max_voxels=param("occupancy_max_voxels", 1200000),
             completed_resolution_m=param("completed_region_resolution_m", 1.0),
             completed_vertical_tolerance_m=param(
                 "completed_region_vertical_tolerance_m", 0.75
             ),
+            support_coverage_resolution_m=param(
+                "support_coverage_resolution_m", 0.5
+            ),
+            support_coverage_range_m=param("support_coverage_range_m", 12.0),
+            support_coverage_max_cells=param(
+                "support_coverage_max_cells", 200000
+            ),
+            support_coverage_min_known_fraction=param(
+                "support_coverage_min_known_fraction", 0.65
+            ),
+            clearance_search_m=param("clearance_search_m", 3.0),
+        )
+        self.region_tracker = RegionCoverageTracker(
+            xy_size_m=self.region_size_m,
+            height_m=self.region_height_m,
+            open_frontier_points=param("region_open_frontier_points", 1),
+            close_frontier_points=param("region_close_frontier_points", 1),
+            reopen_frontier_points=param("region_reopen_frontier_points", 2),
+            coverage_complete_ratio=param("region_coverage_complete_ratio", 0.92),
+            coverage_min_uncovered_cells=param(
+                "region_coverage_min_uncovered_cells", 6
+            ),
+            reopen_new_cells=param("region_reopen_new_cells", 12),
+            unselectable_close_audits=param(
+                "region_unselectable_close_audits", 2
+            ),
+            blocked_frontier_audits=param(
+                "region_blocked_frontier_audits", 3
+            ),
+            orphan_close_audits=param("region_orphan_close_audits", 3),
+            close_audits=param("region_close_audits", 3),
+            reopen_audits=param("region_reopen_audits", 2),
+            defer_retry_s=param("region_defer_retry_s", 30.0),
+            max_failures=param("region_max_failures", 3),
         )
         self.publish_debug_clouds = bool(param("publish_debug_clouds", True))
 
@@ -239,6 +333,14 @@ class FlexEPlanner(object):
         self.frontier_anchor_directions = ()
         self.frontier_unknown_before = 0
         self.global_goal_gain = 0
+        self.global_goal_kind = ""
+        self.global_coverage_before = 0
+        self.global_coverage_revision = 0
+        self.global_coverage_keys = ()
+        self.global_region_support_keys = ()
+        self.active_region = None
+        self.preferred_region = None
+        self.planned_region_route = []
         self.global_goal_search_range_m = self.search_range_m
         self.global_goal_max_expansions = self.max_expansions
         self.blocked_subgoals = []
@@ -269,6 +371,9 @@ class FlexEPlanner(object):
         self.viewpoint_debug_pub = rospy.Publisher(
             "/flex_e/safe_viewpoints", PointCloud2, queue_size=1
         )
+        self.region_debug_pub = rospy.Publisher(
+            "/flex_e/unexplored_regions", PointCloud2, queue_size=1
+        )
         self.odom_sub = rospy.Subscriber(self.odom_topic, Odometry, self._odom_callback, queue_size=50)
         self.terrain_sub = rospy.Subscriber(self.terrain_topic, PointCloud2, self._terrain_callback, queue_size=2)
         self.scan_sub = message_filters.Subscriber(self.registered_scan_topic, PointCloud2)
@@ -293,9 +398,6 @@ class FlexEPlanner(object):
     def _open_trace(self):
         if not self.trace_path:
             return
-        parent = os.path.dirname(os.path.abspath(self.trace_path))
-        if parent and not os.path.isdir(parent):
-            os.makedirs(parent)
         fields = (
             "sim_time_s",
             "decision_ms",
@@ -305,6 +407,18 @@ class FlexEPlanner(object):
             "expanded",
             "frontiers",
             "frontier_regions",
+            "selectable_frontiers",
+            "selectable_coverage",
+            "uncovered_support_cells",
+            "coverage_ratio",
+            "exploring_regions",
+            "covered_regions",
+            "deferred_regions",
+            "inaccessible_regions",
+            "orphaned_regions",
+            "global_region_route",
+            "selected_region",
+            "target_kind",
             "reachable_cells",
             "search_truncated",
             "closure_state",
@@ -314,11 +428,40 @@ class FlexEPlanner(object):
             "target_z",
             "reason",
         )
+
+        # Never silently append new rows through an old CSV schema.  The old
+        # behavior reused the existing header and discarded newly added
+        # diagnostics through extrasaction="ignore", which made a new run look
+        # as if it still used the old planner.  Preserve the old file and pick
+        # a deterministic schema-suffixed sibling instead.
+        trace_path = self.trace_path
+        suffix = 2
+        while os.path.isfile(trace_path) and os.path.getsize(trace_path) > 0:
+            with open(trace_path, "r", newline="", encoding="utf-8") as existing:
+                existing_header = existing.readline().strip()
+            try:
+                existing_fields = tuple(next(csv.reader([existing_header])))
+            except (csv.Error, StopIteration):
+                existing_fields = ()
+            if existing_fields == fields:
+                break
+            root, extension = os.path.splitext(self.trace_path)
+            trace_path = "%s_schema%d%s" % (root, suffix, extension)
+            suffix += 1
+        if trace_path != self.trace_path:
+            rospy.logwarn(
+                "FLEX-E trace schema changed; preserving %s and writing %s",
+                self.trace_path,
+                trace_path,
+            )
+            self.trace_path = trace_path
+
+        parent = os.path.dirname(os.path.abspath(self.trace_path))
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
         self.trace_file = open(self.trace_path, "a+", newline="", encoding="utf-8")
         self.trace_file.seek(0)
         existing_header = self.trace_file.readline().strip()
-        if existing_header:
-            fields = tuple(next(csv.reader([existing_header])))
         self.trace_file.seek(0, os.SEEK_END)
         self.trace_writer = csv.DictWriter(
             self.trace_file,
@@ -447,6 +590,7 @@ class FlexEPlanner(object):
             origin = (float(point.x), float(point.y), float(point.z))
             voxel_count_before = len(self.space.evidence)
             self.space.integrate_scan(origin, xyz)
+            self._observe_support_from_scan(origin)
             if (
                 len(self.space.evidence) - voxel_count_before
                 >= self.occupancy_growth_min_voxels
@@ -455,6 +599,23 @@ class FlexEPlanner(object):
                 self.completion_audit_count = 0
                 self.no_frontier_started_s = None
             self.last_visibility_update_s = stamp
+
+    def _observe_support_from_scan(self, origin):
+        """Mark traversable support visible from this registered scan pose."""
+
+        radius_cells = int(
+            math.ceil(self.space.support_coverage_range_m / self.grid_m)
+        )
+        center_x = int(math.floor(float(origin[0]) / self.grid_m + 0.5))
+        center_y = int(math.floor(float(origin[1]) / self.grid_m + 0.5))
+        support = []
+        for ix in range(center_x - radius_cells, center_x + radius_cells + 1):
+            for iy in range(center_y - radius_cells, center_y + radius_cells + 1):
+                if math.hypot(ix - center_x, iy - center_y) * self.grid_m > self.space.support_coverage_range_m:
+                    continue
+                for key in self.levels.get((ix, iy), ()):
+                    support.append((ix * self.grid_m, iy * self.grid_m, self.cells[key][0]))
+        self.space.observe_support_cells(origin, support, self.vehicle_height_m)
 
     def _trim_old_cells(self):
         for key in sorted(self.cells, key=lambda item: self.cells[item][2])[:max(1, self.max_cells // 20)]:
@@ -494,8 +655,38 @@ class FlexEPlanner(object):
                 if not dx and not dy:
                     continue
                 for candidate in self.levels.get((key[0] + dx, key[1] + dy), ()):
-                    if self._edge_ok(key, candidate):
-                        yield candidate
+                    if not self._edge_ok(key, candidate):
+                        continue
+                    x, y = candidate[0] * self.grid_m, candidate[1] * self.grid_m
+                    if self.space.column_state(
+                        x,
+                        y,
+                        self.cells[candidate][0],
+                        self.hard_traversal_clearance_m,
+                    ) == OCCUPIED:
+                        continue
+                    # Do not cut diagonally between two inflated obstacle
+                    # columns. This makes graph reachability respect the
+                    # vehicle footprint in narrow passages.
+                    if dx and dy:
+                        side_blocked = 0
+                        for side_xy in ((key[0] + dx, key[1]), (key[0], key[1] + dy)):
+                            side_levels = self.levels.get(side_xy, ())
+                            if not any(
+                                self._edge_ok(key, side)
+                                and self.space.column_state(
+                                    side[0] * self.grid_m,
+                                    side[1] * self.grid_m,
+                                    self.cells[side][0],
+                                    self.hard_traversal_clearance_m,
+                                )
+                                != OCCUPIED
+                                for side in side_levels
+                            ):
+                                side_blocked += 1
+                        if side_blocked == 2:
+                            continue
+                    yield candidate
 
     def _frontier_evidence(self, key, include_completed=False):
         """Return visible unknown directions, information gain and risk."""
@@ -505,19 +696,33 @@ class FlexEPlanner(object):
         occupied_columns = 0
         elevation = self.cells[key][0]
         tolerance = self.max_step_m + self.grid_m * math.tan(self.max_slope)
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for dx, dy in (
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ):
             candidates = self.levels.get((key[0] + dx, key[1] + dy), ())
             if any(abs(self.cells[item][0] - elevation) <= tolerance for item in candidates):
                 continue
             x, y = key[0] * self.grid_m, key[1] * self.grid_m
-            if not include_completed and self.space.is_completed(
+            completed = self.space.is_completed(
                 x, y, elevation, dx, dy
-            ):
-                continue
+            )
             evidence = self.space.direction_evidence(
                 x, y, elevation, dx, dy, self.grid_m
             )
             if not evidence.is_frontier:
+                continue
+            if (
+                completed
+                and not include_completed
+                and evidence.unknown_columns < self.completed_reopen_unknown_columns
+            ):
                 continue
             directions.append((dx, dy))
             unknown_columns += evidence.unknown_columns
@@ -545,6 +750,31 @@ class FlexEPlanner(object):
             for blocked_x, blocked_y, blocked_z, _stamp in self.blocked_subgoals
         )
 
+    def _waypoint_clearance(self, key):
+        return self.space.obstacle_clearance(
+            key[0] * self.grid_m,
+            key[1] * self.grid_m,
+            self.cells[key][0],
+        )
+
+    def _safe_waypoint(self, key, minimum_clearance_m=None):
+        if self._blocked(key):
+            return False
+        minimum_clearance_m = (
+            self.minimum_waypoint_clearance_m
+            if minimum_clearance_m is None
+            else max(self.hard_traversal_clearance_m, float(minimum_clearance_m))
+        )
+        x, y = key[0] * self.grid_m, key[1] * self.grid_m
+        if self.space.column_state(
+            x,
+            y,
+            self.cells[key][0],
+            self.hard_traversal_clearance_m,
+        ) == OCCUPIED:
+            return False
+        return self._waypoint_clearance(key) >= minimum_clearance_m
+
     def _prune_memories(self, now_s):
         self.blocked_subgoals = [
             item for item in self.blocked_subgoals if now_s - item[3] <= self.blocked_subgoal_memory_s
@@ -558,6 +788,12 @@ class FlexEPlanner(object):
         self.frontier_anchor_directions = ()
         self.frontier_unknown_before = 0
         self.global_goal_gain = 0
+        self.global_goal_kind = ""
+        self.global_coverage_before = 0
+        self.global_coverage_revision = self.space.coverage_revision
+        self.global_coverage_keys = ()
+        self.global_region_support_keys = ()
+        self.active_region = None
         self.global_goal_search_range_m = self.search_range_m
         self.global_goal_max_expansions = self.max_expansions
         self.global_goal_selected_s = None
@@ -581,6 +817,19 @@ class FlexEPlanner(object):
                     ):
                         count += 1
         return count
+
+    def _region_coverage_snapshot(self, region):
+        total = 0
+        covered = 0
+        for key, values in self.cells.items():
+            if self._region_for_cell(key) != region:
+                continue
+            total += 1
+            if self.space.is_support_covered(
+                key[0] * self.grid_m, key[1] * self.grid_m, values[0]
+            ):
+                covered += 1
+        return covered, total, max(0, total - covered)
 
     def _mark_frontier_region(self, radius_m, reason):
         if self.frontier_anchor is None or not self.frontier_anchor_directions:
@@ -611,11 +860,72 @@ class FlexEPlanner(object):
             self.blocked_subgoals.append(
                 (failed_subgoal[0] * self.grid_m, failed_subgoal[1] * self.grid_m, elevation, now_s)
             )
-        self._mark_frontier_region(self.completed_region_radius_m, reason)
-        rospy.logwarn("FLEX-E physical frontier region rejected: %s", reason)
+        failed_region = self.active_region
+        failures = self.region_tracker.defer(failed_region, now_s)
+        # A controller failure is not evidence that a whole physical subspace
+        # is explored. After repeated failures quarantine only this small
+        # anchor/direction, leaving other entrances in the region eligible.
+        if failures >= self.region_tracker.max_failures:
+            self._mark_frontier_region(
+                self.completed_region_progress_radius_m,
+                "repeated_candidate_failure",
+            )
+        self.preferred_region = None
+        rospy.logwarn(
+            "FLEX-E physical region deferred: %s (region=%s failures=%d)",
+            reason,
+            failed_region,
+            failures,
+        )
         self._clear_global_goal()
 
-    def _finish_frontier_observation(self):
+    def _finish_frontier_observation(self, now_s):
+        observed_region = self.active_region
+        if self.global_goal_kind == "coverage":
+            target_keys = tuple(self.global_coverage_keys)
+            covered_after = sum(
+                self.space.is_support_key_covered(key) for key in target_keys
+            )
+            coverage_gain = max(0, covered_after - self.global_coverage_before)
+            region_keys = tuple(self.global_region_support_keys)
+            region_covered = sum(
+                self.space.is_support_key_covered(key) for key in region_keys
+            )
+            total = len(region_keys)
+            coverage_ratio = float(region_covered) / total if total else 0.0
+            if coverage_ratio >= self.region_tracker.coverage_complete_ratio:
+                outcome = "coverage_region_completed"
+                self.region_tracker.mark_covered(observed_region, total)
+                self.preferred_region = None
+            elif (
+                self.space.coverage_revision > self.global_coverage_revision
+                and coverage_gain >= self.coverage_min_observation_gain
+            ):
+                outcome = "coverage_region_advanced"
+                self.region_tracker.mark_progress(observed_region)
+                self.preferred_region = observed_region
+            else:
+                outcome = "coverage_region_no_information_gain"
+                failures = self.region_tracker.defer(observed_region, now_s)
+                if failures >= self.region_tracker.max_failures:
+                    # Reaching several safe interior views without exposing
+                    # any new support means the residual cells are occluded or
+                    # sampling noise, not a reason to patrol the room again.
+                    outcome = "coverage_region_closed_no_additional_visibility"
+                    self.region_tracker.mark_covered(observed_region, total)
+                self.preferred_region = None
+            rospy.loginfo(
+                "FLEX-E free-space observation: %s, target_covered=%d->%d/%d, gain=%d, region_coverage=%.3f, region=%s",
+                outcome,
+                self.global_coverage_before,
+                covered_after,
+                len(target_keys),
+                coverage_gain,
+                coverage_ratio,
+                observed_region,
+            )
+            self._clear_global_goal()
+            return outcome
         if self.frontier_anchor is None:
             self._clear_global_goal()
             return "frontier_observed_without_anchor"
@@ -628,13 +938,20 @@ class FlexEPlanner(object):
         if not directions or unknown_after < max(1, self.frontier_unknown_before // 3):
             outcome = "frontier_region_closed"
             radius_m = self.completed_region_radius_m
+            self.region_tracker.mark_progress(observed_region)
+            self.preferred_region = observed_region
         elif growth >= self.frontier_min_growth_cells:
             outcome = "frontier_region_advanced"
             radius_m = self.completed_region_progress_radius_m
+            self.region_tracker.mark_progress(observed_region)
+            self.preferred_region = observed_region
         else:
             outcome = "frontier_region_no_information_gain"
-            radius_m = self.completed_region_radius_m
-        self._mark_frontier_region(radius_m, outcome)
+            radius_m = 0.0
+            self.region_tracker.defer(observed_region, now_s)
+            self.preferred_region = None
+        if radius_m > 0.0:
+            self._mark_frontier_region(radius_m, outcome)
         rospy.loginfo(
             "FLEX-E frontier observation: %s, unknown=%d->%d, new_support=%d",
             outcome,
@@ -694,6 +1011,150 @@ class FlexEPlanner(object):
             clusters.append([by_key[key] for key in keys])
         return clusters
 
+    def _region_for_cell(self, key):
+        return self.region_tracker.region_key(
+            key[0] * self.grid_m,
+            key[1] * self.grid_m,
+            self.cells[key][0],
+        )
+
+    def _coverage_region_choice(
+        self,
+        region,
+        uncovered_points,
+        reachable_by_region,
+        costs,
+        root,
+        vehicle,
+        min_goal_distance_m,
+        allow_root_viewpoint,
+    ):
+        """Choose a high-clearance interior viewpoint for free-space coverage."""
+
+        points = list(uncovered_points)[: self.coverage_max_points_per_region]
+        region_cells = list(reachable_by_region.get(region, ()))
+        if not points or not region_cells:
+            return None
+        region_support_keys = tuple(
+            self.space.support_key(
+                key[0] * self.grid_m,
+                key[1] * self.grid_m,
+                self.cells[key][0],
+            )
+            for key in region_cells
+        )
+        centroid = tuple(
+            sum(
+                key[axis] * self.grid_m if axis < 2 else self.cells[key][0]
+                for key in region_cells
+            )
+            / float(len(region_cells))
+            for axis in range(3)
+        )
+        # First keep cells near the physical interior, then prefer the largest
+        # obstacle clearance. The geometric centroid itself is never used as
+        # a goal unless it is an observed, reachable support cell.
+        central_pool = sorted(
+            region_cells,
+            key=lambda key: (
+                (key[0] * self.grid_m - centroid[0]) ** 2
+                + (key[1] * self.grid_m - centroid[1]) ** 2
+                + 0.25 * (self.cells[key][0] - centroid[2]) ** 2,
+                costs.get(key, float("inf")),
+                key,
+            ),
+        )[: self.coverage_candidate_limit * 4]
+        candidates = sorted(
+            central_pool,
+            key=lambda key: (
+                -self._waypoint_clearance(key),
+                (key[0] * self.grid_m - centroid[0]) ** 2
+                + (key[1] * self.grid_m - centroid[1]) ** 2,
+                costs.get(key, float("inf")),
+                key,
+            ),
+        )[: self.coverage_candidate_limit]
+
+        best = None
+        for key in candidates:
+            if key == root and not allow_root_viewpoint:
+                continue
+            if not self._safe_waypoint(key):
+                continue
+            x, y = key[0] * self.grid_m, key[1] * self.grid_m
+            direct = math.hypot(x - vehicle[0], y - vehicle[1])
+            if direct < min_goal_distance_m:
+                continue
+            if len(list(self._neighbors(key))) < self.min_frontier_support:
+                continue
+            ground_z = self.cells[key][0]
+            visibility_keys = self.space.support_visibility_keys(
+                (x, y, ground_z),
+                points,
+                self.vehicle_height_m,
+                self.coverage_max_points_per_region,
+                self.coverage_prediction_min_known_fraction,
+            )
+            visibility_gain = len(visibility_keys)
+            if visibility_gain < self.coverage_min_viewpoint_gain:
+                continue
+            cost = costs.get(key, float("inf"))
+            target_heading = math.atan2(y - vehicle[1], x - vehicle[0])
+            heading_alignment = math.cos(target_heading - self.vehicle_yaw)
+            clearance = self._waypoint_clearance(key)
+            center_distance = math.hypot(x - centroid[0], y - centroid[1])
+            score = (
+                self.coverage_gain_reward * math.log1p(visibility_gain)
+                + self.clearance_reward * min(clearance, self.space.clearance_search_m)
+                + 1.0 / (1.0 + center_distance)
+                + self.distance_reward * cost
+                + 0.5 * self.heading_reward * heading_alignment
+                - self.visited_penalty * int(self._visited(key))
+            )
+            choice = {
+                "score": score,
+                "anchor": key,
+                "viewpoint": key,
+                "gain": 0,
+                "information_gain": visibility_gain,
+                "risk": 0,
+                "cost": cost,
+                "directions": (),
+                "kind": "coverage",
+                "region": region,
+                "uncovered_count": len(uncovered_points),
+                "priority": 0,
+                "coverage_keys": visibility_keys,
+                "region_support_keys": region_support_keys,
+            }
+            if best is None or (choice["score"], key) > (best["score"], best["anchor"]):
+                best = choice
+        return best
+
+    def _publish_region_debug(self):
+        if not self.publish_debug_clouds:
+            return
+        status_value = {
+            EXPLORING: 1.0,
+            DEFERRED: 2.0,
+            COVERED: 3.0,
+            INACCESSIBLE: 4.0,
+        }
+        points = []
+        for key, state in sorted(self.region_tracker.regions.items()):
+            if state.status not in status_value:
+                continue
+            center = self.region_tracker.region_center(key)
+            points.append(center + (status_value[state.status],))
+        header = Header(stamp=rospy.Time.now(), frame_id=self.frame_id)
+        fields = [
+            PointField("x", 0, PointField.FLOAT32, 1),
+            PointField("y", 4, PointField.FLOAT32, 1),
+            PointField("z", 8, PointField.FLOAT32, 1),
+            PointField("intensity", 12, PointField.FLOAT32, 1),
+        ]
+        self.region_debug_pub.publish(point_cloud2.create_cloud(header, fields, points))
+
     def _publish_frontier_debug(self, items, viewpoints):
         if not self.publish_debug_clouds:
             return
@@ -722,6 +1183,8 @@ class FlexEPlanner(object):
         max_expansions=None,
         min_goal_distance_m=None,
         allow_root_viewpoint=False,
+        resolve_orphans=False,
+        frontier_only=False,
     ):
         self._prune_memories(now_s)
         search_range_m = self.search_range_m if search_range_m is None else search_range_m
@@ -734,6 +1197,32 @@ class FlexEPlanner(object):
         parents, costs, expanded, truncated = self._dijkstra(
             root, search_range_m, max_expansions
         )
+        reachable_by_region = defaultdict(list)
+        for key in costs:
+            reachable_by_region[self._region_for_cell(key)].append(key)
+        observed_regions = set(reachable_by_region)
+        region_evidence = defaultdict(
+            lambda: {
+                "frontier_points": 0,
+                "covered_cells": 0,
+                "total_cells": 0,
+                "selectable": 0,
+            }
+        )
+        uncovered_by_region = defaultdict(list)
+        for region, keys in reachable_by_region.items():
+            evidence = region_evidence[region]
+            evidence["total_cells"] = len(keys)
+            for key in keys:
+                point = (
+                    key[0] * self.grid_m,
+                    key[1] * self.grid_m,
+                    self.cells[key][0],
+                )
+                if self.space.is_support_covered(*point):
+                    evidence["covered_cells"] += 1
+                else:
+                    uncovered_by_region[region].append(point)
         items = []
         for key, cost in costs.items():
             if key == root or cost > search_range_m:
@@ -757,24 +1246,18 @@ class FlexEPlanner(object):
             )
             if key == self.last_goal:
                 score -= 3.0
+            region = self._region_for_cell(key)
+            region_evidence[region]["frontier_points"] += 1
             items.append(
-                (score, key, gain, information_gain, risk, cost, direct, directions)
+                (score, key, gain, information_gain, risk, cost, direct, directions, region)
             )
 
         clusters = self._cluster_frontiers(items)
         choices, debug_viewpoints = [], []
-        stats = {
-            "raw": len(items),
-            "regions": len(clusters),
-            "selectable": 0,
-            "unresolved": len(clusters),
-            "reachable": len(costs),
-            "truncated": int(truncated),
-        }
         for cluster in clusters:
             candidates = []
             for item in cluster:
-                score, key, gain, information_gain, risk, cost, direct, directions = item
+                score, key, gain, information_gain, risk, cost, direct, directions, region = item
                 if direct < min_goal_distance_m:
                     continue
                 viewpoint = None
@@ -783,7 +1266,10 @@ class FlexEPlanner(object):
                 ):
                     if option == root and not allow_root_viewpoint:
                         continue
-                    if self._blocked(option):
+                    if not self._safe_waypoint(
+                        option,
+                        self.minimum_frontier_waypoint_clearance_m,
+                    ):
                         continue
                     if self.space.has_clear_line_of_sight(
                         (
@@ -796,6 +1282,7 @@ class FlexEPlanner(object):
                             key[1] * self.grid_m,
                             self.cells[key][0],
                         ),
+                        self.hard_traversal_clearance_m,
                     ):
                         viewpoint = option
                         break
@@ -814,33 +1301,208 @@ class FlexEPlanner(object):
                         risk,
                         cost,
                         directions,
+                        region,
                     )
                 )
             if not candidates:
                 continue
             best = max(candidates)
-            choices.append(
-                (best[0] + self.frontier_cluster_gain_reward * math.sqrt(len(cluster)), best)
-            )
-            debug_viewpoints.append(best[2])
-
-        self._publish_frontier_debug(items, debug_viewpoints)
-        stats["selectable"] = len(choices)
-        if choices:
-            _region_score, best = max(choices, key=lambda item: item[0])
-            _score, key, viewpoint, gain, information_gain, _risk, _cost, directions = best
-            return (
+            (
+                candidate_score,
                 key,
                 viewpoint,
                 gain,
                 information_gain,
+                risk,
+                cost,
                 directions,
+                region,
+            ) = best
+            choices.append(
+                {
+                    "score": candidate_score
+                    + self.frontier_cluster_gain_reward * math.sqrt(len(cluster)),
+                    "anchor": key,
+                    "viewpoint": viewpoint,
+                    "gain": gain,
+                    "information_gain": information_gain,
+                    "risk": risk,
+                    "cost": cost,
+                    "directions": directions,
+                    "kind": "frontier",
+                    "region": region,
+                    "uncovered_count": len(uncovered_by_region.get(region, ())),
+                    "priority": 1,
+                    "coverage_keys": (),
+                    "region_support_keys": (),
+                }
+            )
+            region_evidence[region]["selectable"] += 1
+            debug_viewpoints.append(best[2])
+
+        # Finish the interior of an entered region from a high-clearance
+        # viewpoint. Obstacle surfaces themselves never become goals.
+        for region, uncovered_points in uncovered_by_region.items():
+            evidence = region_evidence[region]
+            total = evidence["total_cells"]
+            covered = evidence["covered_cells"]
+            coverage_ratio = float(covered) / total if total else 0.0
+            if (
+                len(uncovered_points)
+                < self.region_tracker.coverage_min_uncovered_cells
+                or coverage_ratio >= self.region_tracker.coverage_complete_ratio
+            ):
+                continue
+            if frontier_only:
+                # Keep the region open for the later cleanup phase without
+                # spending hundreds of visibility checks during both the
+                # local and global expansion passes.
+                evidence["selectable"] += 1
+                continue
+            choice = self._coverage_region_choice(
+                region,
+                uncovered_points,
+                reachable_by_region,
+                costs,
+                root,
+                vehicle,
+                min_goal_distance_m,
+                allow_root_viewpoint,
+            )
+            if choice is None:
+                # A narrow closed component with no high-clearance viewpoint
+                # is complete once it has no real frontier. Keeping its
+                # low-clearance cells "uncovered" would trap the robot there.
+                if not evidence["frontier_points"]:
+                    evidence["covered_cells"] = total
+                continue
+            region_evidence[region]["selectable"] += 1
+            choices.append(choice)
+            debug_viewpoints.append(choice["viewpoint"])
+
+        self.region_tracker.update(region_evidence, observed_regions, now_s)
+        resolved = self.region_tracker.resolve_unselectable(
+            observed_regions, now_s
+        )
+        # Only a complete reachability pass can prove that a historical
+        # region is disconnected.  A node-limited audit must not quarantine
+        # the unexplored tail of its own truncated search.
+        if resolve_orphans and not truncated:
+            resolved.extend(
+                self.region_tracker.resolve_orphans(observed_regions, now_s)
+            )
+        for region, status in resolved:
+            rospy.loginfo(
+                "FLEX-E resolved unselectable region=%s as %s",
+                region,
+                status,
+            )
+        self._publish_region_debug()
+        counts = self.region_tracker.status_counts(observed_regions)
+        reachable_unresolved = self.region_tracker.unresolved_count(
+            observed_regions, now_s
+        )
+        all_unresolved = self.region_tracker.unresolved_count(now_s=now_s)
+        orphaned_unresolved = max(0, all_unresolved - reachable_unresolved)
+        stats = {
+            "raw": len(items),
+            "regions": len(clusters),
+            "selectable": len(choices),
+            "unresolved": reachable_unresolved
+            + (orphaned_unresolved if resolve_orphans else 0),
+            "orphaned": orphaned_unresolved,
+            "reachable": len(costs),
+            "truncated": int(truncated),
+            "uncovered_cells": sum(
+                max(0, values["total_cells"] - values["covered_cells"])
+                for region, values in region_evidence.items()
+                if self.region_tracker.status(region, now_s)
+                in (EXPLORING, DEFERRED)
+            ),
+            "exploring_regions": counts[EXPLORING],
+            "covered_regions": counts[COVERED],
+            "deferred_regions": counts[DEFERRED],
+            "inaccessible_regions": counts[INACCESSIBLE],
+            "route_regions": 0,
+            "selected_uncovered_count": 0,
+            "selected_coverage_ratio": 1.0,
+            "selected_coverage_keys": (),
+            "selected_region_support_keys": (),
+        }
+        self._publish_frontier_debug(items, debug_viewpoints)
+        active_choices = [
+            choice
+            for choice in choices
+            if self.region_tracker.status(choice["region"], now_s) == EXPLORING
+        ]
+        frontier_choices = [
+            choice for choice in active_choices if choice["kind"] == "frontier"
+        ]
+        coverage_choices = [
+            choice for choice in active_choices if choice["kind"] == "coverage"
+        ]
+        # Expansion is a strict first phase.  Interior coverage cannot hide a
+        # doorway merely because it is nearer: use coverage cleanup only after
+        # the current search scope contains no executable real frontier.
+        eligible_choices = (
+            frontier_choices
+            if frontier_only or frontier_choices
+            else coverage_choices
+        )
+        stats["selectable_frontiers"] = len(frontier_choices)
+        stats["selectable_coverage"] = len(coverage_choices)
+        best_by_region = {}
+        for choice in eligible_choices:
+            previous = best_by_region.get(choice["region"])
+            if previous is None or (
+                choice["priority"], choice["score"], choice["anchor"]
+            ) > (
+                previous["priority"], previous["score"], previous["anchor"]
+            ):
+                best_by_region[choice["region"]] = choice
+        stats["selectable"] = len(best_by_region)
+        route_input = {
+            region: (
+                (
+                    choice["viewpoint"][0] * self.grid_m,
+                    choice["viewpoint"][1] * self.grid_m,
+                    self.cells[choice["viewpoint"]][0],
+                ),
+                choice["cost"],
+            )
+            for region, choice in best_by_region.items()
+        }
+        self.planned_region_route = self.region_tracker.route(
+            route_input,
+            vehicle[:3],
+            self.preferred_region,
+        )
+        stats["route_regions"] = len(self.planned_region_route)
+        if self.planned_region_route:
+            selected_region = self.planned_region_route[0]
+            best = best_by_region[selected_region]
+            self.region_tracker.mark_selected(selected_region, now_s)
+            stats["selected_uncovered_count"] = best["uncovered_count"]
+            stats["selected_coverage_keys"] = best["coverage_keys"]
+            stats["selected_region_support_keys"] = best["region_support_keys"]
+            state = self.region_tracker.regions.get(selected_region)
+            stats["selected_coverage_ratio"] = (
+                state.coverage_ratio if state is not None else 0.0
+            )
+            return (
+                best["anchor"],
+                best["viewpoint"],
+                best["gain"],
+                best["information_gain"],
+                best["directions"],
                 expanded,
                 parents,
                 costs,
                 stats,
+                selected_region,
+                best["kind"],
             )
-        return None, None, 0, 0, (), expanded, parents, costs, stats
+        return None, None, 0, 0, (), expanded, parents, costs, stats, None, ""
 
     def _path_to_goal(self, root, target, now_s, search_range_m, max_expansions):
         if target not in self.cells:
@@ -863,7 +1525,14 @@ class FlexEPlanner(object):
                     heapq.heappush(queue, (candidate, neighbor))
         return None, None, expanded
 
-    def _route_prefix(self, root, target, parents, costs):
+    def _route_prefix(
+        self,
+        root,
+        target,
+        parents,
+        costs,
+        minimum_clearance_m=None,
+    ):
         chain, cursor = [], target
         while cursor is not None:
             chain.append(cursor)
@@ -874,14 +1543,119 @@ class FlexEPlanner(object):
         for key in reversed(chain[:-1]):
             if costs[key] > self.execution_horizon_m + 1.0e-6:
                 break
-            if not self._blocked(key):
+            if self._safe_waypoint(key, minimum_clearance_m):
                 choice = key
         if choice != root or len(chain) == 1:
             return choice
         for key in reversed(chain[:-1]):
-            if not self._blocked(key):
+            if self._safe_waypoint(key, minimum_clearance_m):
                 return key
         return root
+
+    def _egress_prefix(
+        self,
+        root,
+        target,
+        parents,
+        costs,
+        source_region,
+        minimum_clearance_m=None,
+    ):
+        """Place a transit waypoint beyond the exit of a completed region.
+
+        Stopping exactly on a narrow threshold makes the local controller
+        oscillate. When the route leaves the current physical subspace within
+        the execution horizon, continue to the first high-clearance support
+        cell at least ``portal_exit_distance_m`` beyond that crossing.
+        """
+
+        chain, cursor = [], target
+        while cursor is not None:
+            chain.append(cursor)
+            cursor = parents.get(cursor)
+        if not chain or chain[-1] != root:
+            return self._route_prefix(
+                root,
+                target,
+                parents,
+                costs,
+                minimum_clearance_m,
+            )
+        ordered = list(reversed(chain))
+
+        # Detect the actual low-clearance part of the route first. This works
+        # even when a doorway and both rooms happen to lie in the same coarse
+        # 8 m subspace. A narrow cell remains path-traversable because the
+        # inflated occupancy check has already accepted it; it is simply not
+        # a suitable place for the controller to stop and turn.
+        narrow_seen = False
+        last_narrow_cost = 0.0
+        for key in ordered:
+            cost = costs.get(key, float("inf"))
+            if cost > self.portal_exit_search_m + 1.0e-6:
+                break
+            x, y = key[0] * self.grid_m, key[1] * self.grid_m
+            passable = (
+                not self._blocked(key)
+                and self.space.column_state(
+                    x,
+                    y,
+                    self.cells[key][0],
+                    self.hard_traversal_clearance_m,
+                )
+                != OCCUPIED
+            )
+            if passable and self._waypoint_clearance(key) < self.minimum_waypoint_clearance_m:
+                narrow_seen = True
+                last_narrow_cost = cost
+                continue
+            if (
+                narrow_seen
+                and self._safe_waypoint(key)
+                and cost - last_narrow_cost >= self.portal_exit_distance_m
+            ):
+                return key
+
+        transition_index = None
+        for index, key in enumerate(ordered[1:], 1):
+            if self._region_for_cell(key) != source_region:
+                transition_index = index
+                break
+        if transition_index is None:
+            return self._route_prefix(
+                root,
+                target,
+                parents,
+                costs,
+                minimum_clearance_m,
+            )
+        transition_cost = costs.get(ordered[transition_index], float("inf"))
+        if transition_cost > self.portal_exit_search_m + 1.0e-6:
+            return self._route_prefix(
+                root,
+                target,
+                parents,
+                costs,
+                minimum_clearance_m,
+            )
+        fallback = None
+        maximum_cost = transition_cost + self.portal_exit_search_m
+        for key in ordered[transition_index:]:
+            cost = costs.get(key, float("inf"))
+            if cost > maximum_cost + 1.0e-6:
+                break
+            if not self._safe_waypoint(key):
+                continue
+            fallback = key
+            if cost - transition_cost >= self.portal_exit_distance_m:
+                return key
+        return fallback or self._route_prefix(
+            root,
+            target,
+            parents,
+            costs,
+            minimum_clearance_m,
+        )
 
     def _frontier_viewpoint_options(self, root, target, parents, costs):
         """Order observed support cells by proximity to the desired standoff."""
@@ -999,6 +1773,16 @@ class FlexEPlanner(object):
             "expanded": 0,
             "frontiers": 0,
             "frontier_regions": 0,
+            "uncovered_support_cells": 0,
+            "coverage_ratio": 1.0,
+            "exploring_regions": 0,
+            "covered_regions": 0,
+            "deferred_regions": 0,
+            "inaccessible_regions": 0,
+            "orphaned_regions": 0,
+            "global_region_route": 0,
+            "selected_region": "",
+            "target_kind": "",
             "reachable_cells": 0,
             "search_truncated": 0,
             "closure_state": "",
@@ -1057,7 +1841,8 @@ class FlexEPlanner(object):
                     self.global_observe_started_s = now_s
                     self.global_observe_revision = self.space.revision
                     rospy.loginfo(
-                        "FLEX-E safe frontier viewpoint reached; observing physical region"
+                        "FLEX-E safe %s viewpoint reached; observing physical region",
+                        self.global_goal_kind,
                     )
                 observe_elapsed = now_s - self.global_observe_started_s
                 scan_arrived = self.space.revision > self.global_observe_revision
@@ -1068,9 +1853,9 @@ class FlexEPlanner(object):
                         and observe_elapsed < 2.0 * self.frontier_observation_wait_s
                     )
                 ):
-                    row["reason"] = "observing_frontier_region"
+                    row["reason"] = "observing_%s_region" % self.global_goal_kind
                 else:
-                    row["reason"] = self._finish_frontier_observation()
+                    row["reason"] = self._finish_frontier_observation(now_s)
             else:
                 parents, costs, expanded = self._path_to_goal(
                     root,
@@ -1081,18 +1866,30 @@ class FlexEPlanner(object):
                 )
                 row["expanded"] = expanded
                 if parents is not None:
-                    subgoal = self._route_prefix(root, self.global_goal, parents, costs)
+                    source_region = self._region_for_cell(root)
+                    subgoal = self._egress_prefix(
+                        root,
+                        self.global_goal,
+                        parents,
+                        costs,
+                        source_region,
+                        (
+                            self.minimum_frontier_waypoint_clearance_m
+                            if self.global_goal_kind == "frontier"
+                            else self.minimum_waypoint_clearance_m
+                        ),
+                    )
                     self._publish_subgoal(
                         subgoal,
                         self.global_goal,
                         self.global_goal_gain,
                         now_s,
                         row,
-                        "continued_global_frontier",
+                        "continued_global_%s" % self.global_goal_kind,
                     )
                 else:
-                    rospy.logwarn("FLEX-E global frontier is no longer graph-reachable")
-                    self._fail_frontier(now_s, None, "frontier_unreachable")
+                    rospy.logwarn("FLEX-E global region goal is no longer graph-reachable")
+                    self._fail_frontier(now_s, None, "region_goal_unreachable")
 
         if self.global_goal is None and self.active_goal is None:
             if now_s < self.next_frontier_search_s:
@@ -1107,7 +1904,14 @@ class FlexEPlanner(object):
                 parents,
                 costs,
                 frontier_stats,
-            ) = self._select_frontier(root, self.vehicle, now_s)
+                selected_region,
+                target_kind,
+            ) = self._select_frontier(
+                root,
+                self.vehicle,
+                now_s,
+                frontier_only=True,
+            )
             search_mode = "local"
             if target is None:
                 rospy.loginfo_throttle(
@@ -1126,12 +1930,15 @@ class FlexEPlanner(object):
                     parents,
                     costs,
                     frontier_stats,
+                    selected_region,
+                    target_kind,
                 ) = self._select_frontier(
                     root,
                     self.vehicle,
                     now_s,
                     self.global_search_range_m,
                     self.global_max_expansions,
+                    frontier_only=True,
                 )
                 search_mode = "global_fallback"
             if target is None:
@@ -1149,6 +1956,8 @@ class FlexEPlanner(object):
                     parents,
                     costs,
                     frontier_stats,
+                    selected_region,
+                    target_kind,
                 ) = self._select_frontier(
                     root,
                     self.vehicle,
@@ -1157,6 +1966,7 @@ class FlexEPlanner(object):
                     self.completion_max_expansions,
                     min_goal_distance_m=self.cleanup_goal_distance_m,
                     allow_root_viewpoint=True,
+                    resolve_orphans=True,
                 )
                 search_mode = "closure_audit"
             row.update(
@@ -1164,6 +1974,18 @@ class FlexEPlanner(object):
                     "expanded": expanded,
                     "frontiers": frontier_stats["raw"],
                     "frontier_regions": frontier_stats["regions"],
+                    "selectable_frontiers": frontier_stats["selectable_frontiers"],
+                    "selectable_coverage": frontier_stats["selectable_coverage"],
+                    "uncovered_support_cells": frontier_stats["uncovered_cells"],
+                    "coverage_ratio": frontier_stats["selected_coverage_ratio"],
+                    "exploring_regions": frontier_stats["exploring_regions"],
+                    "covered_regions": frontier_stats["covered_regions"],
+                    "deferred_regions": frontier_stats["deferred_regions"],
+                    "inaccessible_regions": frontier_stats["inaccessible_regions"],
+                    "orphaned_regions": frontier_stats["orphaned"],
+                    "global_region_route": frontier_stats["route_regions"],
+                    "selected_region": "" if selected_region is None else str(selected_region),
+                    "target_kind": target_kind,
                     "reachable_cells": frontier_stats["reachable"],
                     "search_truncated": frontier_stats["truncated"],
                     "information_gain": information_gain,
@@ -1208,10 +2030,15 @@ class FlexEPlanner(object):
                     row["reason"] = "closure_audit_" + closure_state.lower()
                 rospy.loginfo_throttle(
                     5.0,
-                    "FLEX-E closure audit: state=%s raw=%d regions=%d selectable=%d reachable=%d expanded=%d truncated=%d quiet=%.1fs stable=%d/%d",
+                    "FLEX-E closure audit: state=%s raw=%d frontier_regions=%d uncovered_support=%d exploring=%d deferred=%d inaccessible=%d orphaned=%d selectable=%d reachable=%d expanded=%d truncated=%d quiet=%.1fs stable=%d/%d",
                     closure_state,
                     frontier_stats["raw"],
                     frontier_stats["regions"],
+                    frontier_stats["uncovered_cells"],
+                    frontier_stats["exploring_regions"],
+                    frontier_stats["deferred_regions"],
+                    frontier_stats["inaccessible_regions"],
+                    frontier_stats["orphaned"],
                     frontier_stats["selectable"],
                     frontier_stats["reachable"],
                     expanded,
@@ -1231,6 +2058,19 @@ class FlexEPlanner(object):
             self.closed_pub.publish(Bool(data=False))
             self.next_frontier_search_s = 0.0
             self.global_goal, self.frontier_anchor, self.global_goal_gain = viewpoint, target, gain
+            self.active_region = selected_region
+            self.global_goal_kind = target_kind
+            self.global_coverage_keys = tuple(
+                frontier_stats["selected_coverage_keys"]
+            )
+            self.global_region_support_keys = tuple(
+                frontier_stats["selected_region_support_keys"]
+            )
+            self.global_coverage_before = sum(
+                self.space.is_support_key_covered(key)
+                for key in self.global_coverage_keys
+            )
+            self.global_coverage_revision = self.space.coverage_revision
             self.frontier_anchor_directions = directions
             self.frontier_unknown_before = information_gain
             self.global_goal_selected_s = now_s
@@ -1246,11 +2086,29 @@ class FlexEPlanner(object):
                 self.global_goal_search_range_m = self.search_range_m
                 self.global_goal_max_expansions = self.max_expansions
             self.last_goal = target
-            subgoal = self._route_prefix(root, viewpoint, parents, costs)
-            reason = (
-                "new_%s_true_frontier_direction_%d_information_%d"
-                % (search_mode, gain, information_gain)
+            source_region = self._region_for_cell(root)
+            subgoal = self._egress_prefix(
+                root,
+                viewpoint,
+                parents,
+                costs,
+                source_region,
+                (
+                    self.minimum_frontier_waypoint_clearance_m
+                    if target_kind == "frontier"
+                    else self.minimum_waypoint_clearance_m
+                ),
             )
+            if target_kind == "coverage":
+                reason = "new_%s_interior_coverage_information_%d" % (
+                    search_mode,
+                    information_gain,
+                )
+            else:
+                reason = (
+                    "new_%s_true_frontier_direction_%d_information_%d"
+                    % (search_mode, gain, information_gain)
+                )
             self._publish_subgoal(
                 subgoal,
                 viewpoint,
