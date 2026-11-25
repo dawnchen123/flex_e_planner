@@ -70,6 +70,46 @@ class ExplorationSpaceEvaluatorTest(unittest.TestCase):
             evaluator.direction_evidence(0.0, 0.0, 0.0, 1, 0, 0.5).is_frontier
         )
 
+    def test_portal_evidence_uses_only_clear_centerline_prefix(self):
+        evaluator = self.evaluator()
+        evaluator.evidence[(0, 0, 1)] = -2
+        evaluator.evidence[(4, 0, 1)] = 3
+
+        # A wall in the far part of the fan closes the ordinary direction,
+        # but does not erase a near scan seam seen from known free support.
+        self.assertFalse(
+            evaluator.direction_evidence(0.0, 0.0, 0.0, 1, 0, 0.5).is_frontier
+        )
+        result = evaluator.portal_evidence(0.0, 0.0, 0.0, 1, 0, 0.5, 0.45)
+        self.assertTrue(result.is_frontier)
+        self.assertEqual(result.unknown_columns, 2)
+
+        evaluator.evidence[(1, 1, 1)] = 3
+        evaluator._column_cache.clear()
+        result = evaluator.portal_evidence(0.0, 0.0, 0.0, 1, 0, 0.5, 0.45)
+        self.assertFalse(result.is_frontier)
+        self.assertEqual(result.occupied_columns, 1)
+
+    def test_portal_requires_free_approach_and_contiguous_unknown(self):
+        evaluator = self.evaluator()
+        self.assertFalse(
+            evaluator.portal_evidence(0.0, 0.0, 0.0, 1, 0, 0.5, 0.45).is_frontier
+        )
+        for ix in (0, 2, 3, 4):
+            evaluator.evidence[(ix, 0, 1)] = -2
+        evaluator._column_cache.clear()
+        self.assertFalse(
+            evaluator.portal_evidence(0.0, 0.0, 0.0, 1, 0, 0.5, 0.45).is_frontier
+        )
+
+        # Side columns can be entirely unknown when the centerline has no
+        # unknown seam, e.g. a ray-observed unsupported drop boundary.
+        evaluator.evidence[(1, 0, 1)] = -2
+        evaluator._column_cache.clear()
+        self.assertFalse(
+            evaluator.portal_evidence(0.0, 0.0, 0.0, 1, 0, 0.5, 0.45).is_frontier
+        )
+
     def test_ray_updates_free_and_occupied_evidence(self):
         evaluator = self.evaluator(min_range_m=0.1, max_range_m=10.0)
         used = evaluator.integrate_scan(
@@ -145,6 +185,30 @@ class ExplorationSpaceEvaluatorTest(unittest.TestCase):
                 )
             ),
             1,
+        )
+
+    def test_prediction_uses_observation_threshold_and_rejects_occupied_endpoint(self):
+        evaluator = self.evaluator(support_coverage_min_known_fraction=0.65)
+        origin = (0.0, 0.0, 0.0)
+        goal = (2.0, 0.0, 0.0)
+        evaluator.evidence[(1, 0, 1)] = -2
+        evaluator.evidence[(2, 0, 1)] = -2
+        # Two of the three intermediate columns are now known.
+        evaluator.evidence[(4, 0, 1)] = 3
+        self.assertEqual(evaluator.support_visibility_keys(origin, [goal], 1.0), ())
+        evaluator.evidence[(4, 0, 1)] = -2
+        evaluator.evidence.pop((2, 0, 1))
+        evaluator._column_cache.clear()
+        self.assertEqual(
+            evaluator.support_visibility_keys(origin, [goal], 1.0, minimum_known_fraction=0.3),
+            (),
+        )
+        evaluator.evidence[(2, 0, 1)] = -2
+        evaluator._column_cache.clear()
+        result = evaluator.support_visibility_keys(origin, [goal, goal], 1.0)
+        self.assertEqual(result, (evaluator.support_key(*goal),))
+        self.assertEqual(
+            evaluator.support_visibility_keys(origin, [goal], 1.0, excluded_keys=result), ()
         )
 
     def test_line_of_sight_accepts_frontier_footprint_override(self):

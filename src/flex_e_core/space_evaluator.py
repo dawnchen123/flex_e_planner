@@ -114,26 +114,66 @@ class ExplorationSpaceEvaluator(object):
     def _round_cell(value, resolution):
         return int(math.floor(float(value) / resolution + 0.5))
 
-    def integrate_scan(self, origin, points):
-        """Ray-integrate a bounded, deterministic subset of a registered scan."""
+    def integrate_scan(self, origin, points, misses_xyz=None):
+        """Integrate returns and optional no-hit rays in the registered frame.
+
+        No-hit rays mark visible space free through their endpoint. A return
+        in the same voxel always takes precedence over no-hit free evidence.
+        """
 
         xyz = np.asarray(points, dtype=np.float64)
         if xyz.ndim != 2 or xyz.shape[1] != 3:
             raise ValueError("registered scan must be an N x 3 array")
-        if not len(xyz):
+        if misses_xyz is None:
+            misses = np.empty((0, 3), dtype=np.float64)
+        else:
+            misses = np.asarray(misses_xyz, dtype=np.float64)
+            if misses.ndim != 2 or misses.shape[1] != 3:
+                raise ValueError("no-hit scan must be an N x 3 array")
+        if not len(xyz) and not len(misses):
             return 0
         origin = np.asarray(origin, dtype=np.float64).reshape(3)
         finite = np.isfinite(xyz).all(axis=1)
         xyz = xyz[finite]
-        if not len(xyz):
+        if misses_xyz is None and not len(xyz):
             return 0
         offsets = xyz - origin
         ranges = np.linalg.norm(offsets, axis=1)
         valid = (ranges >= self.min_range_m) & (ranges <= self.max_range_m)
         xyz, ranges = xyz[valid], ranges[valid]
-        if not len(xyz):
+        if misses_xyz is None and not len(xyz):
             return 0
-        if len(xyz) > self.max_rays:
+
+        misses = misses[np.isfinite(misses).all(axis=1)]
+        miss_offsets = misses - origin
+        miss_ranges = np.linalg.norm(miss_offsets, axis=1)
+        valid_misses = (miss_ranges >= self.min_range_m) & (miss_ranges > 1.0e-9)
+        misses, miss_offsets, miss_ranges = (
+            misses[valid_misses],
+            miss_offsets[valid_misses],
+            miss_ranges[valid_misses],
+        )
+        if len(misses):
+            # Perspective depth can exceed the radial map range at the edge
+            # of the camera image; clip these rays to the occupancy range.
+            clipped = np.minimum(miss_ranges, self.max_range_m)
+            misses = origin + miss_offsets * (clipped / miss_ranges)[:, None]
+            miss_ranges = clipped
+        if not len(xyz) and not len(misses):
+            return 0
+        if len(misses):
+            hit_budget = min(len(xyz), self.max_rays // 2)
+            if len(xyz) > hit_budget:
+                indices = np.linspace(0, len(xyz) - 1, hit_budget, dtype=np.int64)
+                xyz, ranges = xyz[indices], ranges[indices]
+            miss_budget = self.max_rays - len(xyz)
+            if len(misses) > miss_budget:
+                indices = np.linspace(
+                    0, len(misses) - 1, miss_budget, dtype=np.int64
+                )
+                misses, miss_ranges = misses[indices], miss_ranges[indices]
+        elif len(xyz) > self.max_rays:
+            # Preserve the original hit-only selection exactly.
             indices = np.linspace(0, len(xyz) - 1, self.max_rays, dtype=np.int64)
             xyz, ranges = xyz[indices], ranges[indices]
 
@@ -155,6 +195,19 @@ class ExplorationSpaceEvaluator(object):
                 if key != endpoint:
                     free_updates.add(key)
 
+        for point, distance in zip(misses, miss_ranges):
+            direction = (point - origin) / float(distance)
+            steps = max(0, int((float(distance) - 0.5 * resolution) / self.ray_step_m))
+            for step in range(1, steps + 1):
+                position = origin + direction * (step * self.ray_step_m)
+                free_updates.add(
+                    tuple(self._round_cell(value, resolution) for value in position)
+                )
+            # A no-hit maximum-range endpoint is observed free, not occupied.
+            free_updates.add(
+                tuple(self._round_cell(value, resolution) for value in point)
+            )
+
         # A return in this scan takes precedence over free rays crossing the
         # same coarse voxel.
         free_updates.difference_update(occupied_updates)
@@ -171,7 +224,7 @@ class ExplorationSpaceEvaluator(object):
             self.revision += 1
             self._column_cache.clear()
             self._clearance_cache.clear()
-        return len(xyz)
+        return len(xyz) + len(misses)
 
     def _support_key(self, x, y, z):
         resolution = self.support_coverage_resolution_m
@@ -280,6 +333,7 @@ class ExplorationSpaceEvaluator(object):
         sensor_height_m,
         max_checks=256,
         minimum_known_fraction=0.0,
+        excluded_keys=(),
     ):
         """Return the exact support-key set used for predicted coverage gain."""
 
@@ -290,9 +344,15 @@ class ExplorationSpaceEvaluator(object):
             float(support_position[2]) + float(sensor_height_m),
         )
         visible = []
+        seen = set(excluded_keys)
+        minimum_known_fraction = max(
+            minimum_known_fraction, self.support_coverage_min_known_fraction
+        )
         for point in points:
             key = self._support_key(*point)
-            if key in self.covered_support:
+            if key in seen or key in self.covered_support:
+                continue
+            if self.column_state(*point) == OCCUPIED:
                 continue
             if self.has_clear_support_line(
                 sensor,
@@ -301,6 +361,7 @@ class ExplorationSpaceEvaluator(object):
                 minimum_known_fraction,
             ):
                 visible.append(key)
+                seen.add(key)
         return tuple(visible)
 
     def obstacle_clearance(self, x, y, ground_z, max_distance_m=None):
@@ -447,6 +508,64 @@ class ExplorationSpaceEvaluator(object):
             unknown_columns,
             occupied_fan,
         )
+
+    def portal_evidence(
+        self, x, y, ground_z, dx, dy, terrain_resolution_m, inflation_m,
+        lookahead_m=None,
+    ):
+        """Find a short, footprint-clear approach to a centerline unknown seam.
+
+        The caller supplies an observed, reachable terrain support anchor.
+        Require ray-cleared approach evidence followed by two distinct unknown
+        columns. Occupied clearance columns before or inside that prefix veto
+        the hypothesis. Space after the seam and lateral unknowns do not count.
+        The result is an observation candidate, not permission to drive into
+        unknown or unsupported terrain.
+        """
+
+        direction_norm = math.hypot(dx, dy)
+        if direction_norm <= 1.0e-9:
+            return DirectionEvidence()
+        unit_x, unit_y = dx / direction_norm, dy / direction_norm
+        distance = (
+            self.frontier_lookahead_m if lookahead_m is None
+            else max(0.0, float(lookahead_m))
+        )
+        if distance <= 0.0:
+            return DirectionEvidence()
+
+        # Sub-voxel sampling avoids skipping a column at a diagonal crossing.
+        stride = 0.5 * min(self.resolution_m, max(0.1, float(terrain_resolution_m)))
+        steps = max(1, int(math.ceil(distance / stride)))
+        previous_column = None
+        free_approach = False
+        unknown_columns = 0
+        for step in range(steps + 1):
+            along = (distance * step) / steps
+            sample_x, sample_y = x + unit_x * along, y + unit_y * along
+            column = (
+                self._round_cell(sample_x, self.resolution_m),
+                self._round_cell(sample_y, self.resolution_m),
+            )
+            if column == previous_column:
+                continue
+            previous_column = column
+            state = self.column_state(sample_x, sample_y, ground_z, inflation_m)
+            if state == OCCUPIED:
+                return DirectionEvidence(False, 0, 1)
+            if state == FREE:
+                if unknown_columns:
+                    # One unknown column with known space on both sides is a
+                    # sampling gap rather than a persistent portal seam.
+                    return DirectionEvidence()
+                free_approach = True
+            elif step != 0:
+                if not free_approach:
+                    return DirectionEvidence()
+                unknown_columns += 1
+                if unknown_columns >= 2:
+                    return DirectionEvidence(True, unknown_columns, 0)
+        return DirectionEvidence(False, unknown_columns, 0)
 
     def has_clear_line_of_sight(self, start, end, inflation_m=None):
         """Check the inflated robot-clearance columns between two viewpoints."""

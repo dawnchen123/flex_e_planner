@@ -24,6 +24,7 @@ class RegionState(object):
     __slots__ = (
         "status",
         "frontier_points",
+        "gap_cells",
         "covered_cells",
         "total_cells",
         "coverage_ratio",
@@ -33,18 +34,21 @@ class RegionState(object):
         "failures",
         "defer_until_s",
         "last_update_s",
-        "last_audit_s",
+        "last_reopen_audit_s",
         "last_selected_s",
         "covered_total_cells",
         "unselectable_audits",
         "last_unselectable_audit_s",
         "orphan_audits",
         "last_orphan_audit_s",
+        "last_closure_audit_s",
+        "inaccessible_reason",
     )
 
     def __init__(self):
         self.status = UNSEEN
         self.frontier_points = 0
+        self.gap_cells = 0
         self.covered_cells = 0
         self.total_cells = 0
         self.coverage_ratio = 0.0
@@ -54,13 +58,15 @@ class RegionState(object):
         self.failures = 0
         self.defer_until_s = 0.0
         self.last_update_s = 0.0
-        self.last_audit_s = -float("inf")
+        self.last_reopen_audit_s = -float("inf")
         self.last_selected_s = -float("inf")
         self.covered_total_cells = 0
         self.unselectable_audits = 0
         self.last_unselectable_audit_s = -float("inf")
         self.orphan_audits = 0
         self.last_orphan_audit_s = -float("inf")
+        self.last_closure_audit_s = -float("inf")
+        self.inaccessible_reason = ""
 
 
 class RegionCoverageTracker(object):
@@ -83,9 +89,11 @@ class RegionCoverageTracker(object):
         reopen_audits=2,
         defer_retry_s=30.0,
         max_failures=3,
+        height_origin_m=0.0,
     ):
         self.xy_size_m = max(1.0, float(xy_size_m))
         self.height_m = max(0.5, float(height_m))
+        self.height_origin_m = float(height_origin_m)
         self.open_frontier_points = max(1, int(open_frontier_points))
         self.close_frontier_points = max(1, int(close_frontier_points))
         self.reopen_frontier_points = max(
@@ -115,14 +123,14 @@ class RegionCoverageTracker(object):
         return (
             self._cell(x, self.xy_size_m),
             self._cell(y, self.xy_size_m),
-            self._cell(z, self.height_m),
+            self._cell(z - self.height_origin_m, self.height_m),
         )
 
     def region_center(self, key):
         return (
             (key[0] + 0.5) * self.xy_size_m,
             (key[1] + 0.5) * self.xy_size_m,
-            (key[2] + 0.5) * self.height_m,
+            self.height_origin_m + (key[2] + 0.5) * self.height_m,
         )
 
     def _get(self, key):
@@ -132,14 +140,24 @@ class RegionCoverageTracker(object):
             self.regions[key] = state
         return state
 
-    def update(self, evidence, observed_regions, now_s):
+    def _has_coverage_gap(self, state):
+        return state.gap_cells > 0 or self._has_ratio_gap(
+            state.covered_cells, state.total_cells
+        )
+
+    def _has_ratio_gap(self, covered, total):
+        return (
+            total - covered >= self.coverage_min_uncovered_cells
+            and covered / total < self.coverage_complete_ratio
+        )
+
+    def update(self, evidence, observed_regions, now_s, allow_closure=True):
         """Update only subspaces covered by the current graph search.
 
-        ``evidence`` maps a region key to counts named ``frontier_points``,
-        ``covered_cells``, ``total_cells`` and ``selectable``. Completion is
-        therefore based on observed traversable space, not on distance to
-        obstacle surfaces. Not touching regions outside ``observed_regions``
-        prevents a short local search from closing a distant subspace.
+        ``gap_cells`` counts uncovered support belonging to actionable spatial
+        patches. A narrow search may expose new gaps or frontiers, but only
+        a full audit can clear prior evidence. Selectability stays local to
+        the current search.
         """
 
         observed = set(observed_regions)
@@ -150,37 +168,46 @@ class RegionCoverageTracker(object):
             covered = max(0, int(values.get("covered_cells", 0)))
             total = max(0, int(values.get("total_cells", 0)))
             covered = min(covered, total)
+            gap = min(total - covered, max(0, int(values.get("gap_cells", 0))))
             selectable = max(0, int(values.get("selectable", 0)))
             state = self.regions.get(key)
             if state is None and not (frontier or total or selectable):
                 continue
             state = self._get(key)
-            state.frontier_points = frontier
-            state.covered_cells = covered
-            state.total_cells = total
-            state.coverage_ratio = float(covered) / total if total else 0.0
+            if allow_closure:
+                state.frontier_points = frontier
+                state.gap_cells = gap
+            else:
+                state.frontier_points = max(state.frontier_points, frontier)
+                state.gap_cells = max(state.gap_cells, gap)
+            if allow_closure or (
+                not math.isfinite(state.last_closure_audit_s)
+                and total >= state.total_cells
+            ):
+                state.covered_cells = covered
+                state.total_cells = total
+                state.coverage_ratio = float(covered) / total if total else 0.0
             state.selectable = selectable
             if selectable:
                 state.unselectable_audits = 0
             state.last_update_s = float(now_s)
             state.orphan_audits = 0
-            new_audit = float(now_s) > state.last_audit_s + 1.0e-6
-            if new_audit:
-                state.last_audit_s = float(now_s)
+            new_closure_audit = (
+                allow_closure and float(now_s) > state.last_closure_audit_s + 1.0e-6
+            )
+            if new_closure_audit:
+                state.last_closure_audit_s = float(now_s)
 
-            uncovered = max(0, total - covered)
-            coverage_open = (
-                uncovered >= self.coverage_min_uncovered_cells
-                and state.coverage_ratio < self.coverage_complete_ratio
+            coverage_open = self._has_coverage_gap(state) or self._has_ratio_gap(
+                covered, total
             )
-            is_open = frontier >= self.open_frontier_points or coverage_open
-            coverage_complete = (
-                total > 0
-                and state.coverage_ratio >= self.coverage_complete_ratio
-            )
+            is_open = state.frontier_points >= self.open_frontier_points or coverage_open
             is_complete = (
-                frontier < self.close_frontier_points
-                and coverage_complete
+                allow_closure
+                and total > 0
+                and covered / total >= self.coverage_complete_ratio
+                and frontier < self.close_frontier_points
+                and gap == 0
             )
             # A stable feasible frontier must be able to reopen a room before
             # the robot enters it; requiring graph growth as well creates a
@@ -192,7 +219,17 @@ class RegionCoverageTracker(object):
                     and selectable > 0
                 )
                 or total >= state.covered_total_cells + self.reopen_new_cells
+                or gap > 0
             )
+
+            if state.status == INACCESSIBLE and state.inaccessible_reason == "no_viewpoint":
+                # Persistent gaps alone do not create a safe viewpoint.
+                is_strong = selectable > 0 and is_open
+
+            if state.status == INACCESSIBLE and state.inaccessible_reason == "disconnected":
+                # A path to this region is now present in the observed graph.
+                state.status = EXPLORING
+                state.inaccessible_reason = ""
 
             if state.status == DEFERRED:
                 if now_s < state.defer_until_s:
@@ -210,7 +247,7 @@ class RegionCoverageTracker(object):
                     # of stable closure audits, but never produces a waypoint
                     # merely to approach its boundary.
                     state.status = EXPLORING
-                    state.empty_audits = 1 if is_complete and new_audit else 0
+                    state.empty_audits = 1 if is_complete and new_closure_audit else 0
                     if state.empty_audits >= self.close_audits:
                         state.status = COVERED
                         state.covered_total_cells = total
@@ -218,31 +255,39 @@ class RegionCoverageTracker(object):
 
             if state.status == EXPLORING:
                 state.reopen_audits = 0
-                if is_complete:
-                    if new_audit:
+                if new_closure_audit:
+                    if is_complete:
                         state.empty_audits += 1
-                    if state.empty_audits >= self.close_audits:
-                        state.status = COVERED
-                        state.failures = 0
-                        state.covered_total_cells = total
-                else:
-                    state.empty_audits = 0
+                        if state.empty_audits >= self.close_audits:
+                            self.mark_covered(key, total)
+                    else:
+                        state.empty_audits = 0
                 continue
 
             if state.status in (COVERED, INACCESSIBLE):
-                state.empty_audits = 0
+                if state.status == INACCESSIBLE and is_complete:
+                    if new_closure_audit:
+                        state.empty_audits += 1
+                        if state.empty_audits >= self.close_audits:
+                            self.mark_covered(key, total)
+                    continue
+                if new_closure_audit:
+                    state.empty_audits = 0
                 if is_strong:
-                    if new_audit:
+                    if float(now_s) > state.last_reopen_audit_s + 1.0e-6:
+                        state.last_reopen_audit_s = float(now_s)
                         state.reopen_audits += 1
                     if state.reopen_audits >= self.reopen_audits:
                         state.status = EXPLORING
+                        state.inaccessible_reason = ""
                         state.reopen_audits = 0
-                else:
+                elif new_closure_audit:
                     state.reopen_audits = 0
 
     def mark_selected(self, key, now_s):
         state = self._get(key)
         state.status = EXPLORING
+        state.inaccessible_reason = ""
         state.last_selected_s = float(now_s)
         state.empty_audits = 0
         state.unselectable_audits = 0
@@ -252,22 +297,37 @@ class RegionCoverageTracker(object):
             return
         state = self._get(key)
         state.status = EXPLORING
+        state.inaccessible_reason = ""
         state.empty_audits = 0
         state.failures = max(0, state.failures - 1)
         state.unselectable_audits = 0
 
-    def mark_covered(self, key, total_cells=None):
+    def mark_covered(self, key, total_cells=None, covered_cells=None):
         if key is None:
             return
         state = self._get(key)
         state.status = COVERED
+        state.inaccessible_reason = ""
         state.empty_audits = self.close_audits
         state.reopen_audits = 0
         state.failures = 0
         state.unselectable_audits = 0
         if total_cells is not None:
             state.total_cells = max(0, int(total_cells))
+        if covered_cells is not None:
+            state.covered_cells = min(state.total_cells, max(0, int(covered_cells)))
+            state.coverage_ratio = state.covered_cells / state.total_cells if state.total_cells else 0.0
         state.covered_total_cells = state.total_cells
+
+    def mark_unselectable(self, key, reason):
+        if key is None:
+            return
+        state = self._get(key)
+        state.status = INACCESSIBLE
+        state.inaccessible_reason = reason
+        state.covered_total_cells = state.total_cells
+        state.empty_audits = 0
+        state.reopen_audits = 0
 
     def defer(self, key, now_s):
         if key is None:
@@ -281,14 +341,7 @@ class RegionCoverageTracker(object):
         return state.failures
 
     def resolve_unselectable(self, regions, now_s):
-        """Bound OPEN-without-a-target instead of leaving it alive forever.
-
-        A frontier-free region with no informative interior viewpoint contains
-        only occluded/sampling residuals and is closed after a short audit. A
-        region that repeatedly has raw frontier evidence but no safe viewpoint
-        is classified INACCESSIBLE under the current robot footprint. Both may
-        reopen later through stable frontier evidence or graph growth.
-        """
+        """Record persistent lack of a safe viewpoint while preserving coverage."""
 
         changed = []
         for key in set(regions):
@@ -302,14 +355,13 @@ class RegionCoverageTracker(object):
                 continue
             state.last_unselectable_audit_s = float(now_s)
             state.unselectable_audits += 1
-            if state.frontier_points:
-                if state.unselectable_audits >= self.blocked_frontier_audits:
-                    state.status = INACCESSIBLE
-                    state.covered_total_cells = state.total_cells
-                    changed.append((key, INACCESSIBLE))
-            elif state.unselectable_audits >= self.unselectable_close_audits:
-                self.mark_covered(key, state.total_cells)
-                changed.append((key, COVERED))
+            threshold = (
+                self.blocked_frontier_audits if state.frontier_points
+                else self.unselectable_close_audits
+            )
+            if state.unselectable_audits >= threshold:
+                self.mark_unselectable(key, "no_viewpoint")
+                changed.append((key, INACCESSIBLE))
         return changed
 
     def resolve_orphans(self, reachable_regions, now_s):
@@ -318,15 +370,14 @@ class RegionCoverageTracker(object):
         reachable = set(reachable_regions)
         changed = []
         for key, state in self.regions.items():
-            if key in reachable or state.status not in (EXPLORING, DEFERRED):
+            if key in reachable or not self._unresolved(state):
                 continue
             if float(now_s) <= state.last_orphan_audit_s + 1.0e-6:
                 continue
             state.last_orphan_audit_s = float(now_s)
             state.orphan_audits += 1
             if state.orphan_audits >= self.orphan_close_audits:
-                state.status = INACCESSIBLE
-                state.covered_total_cells = state.total_cells
+                self.mark_unselectable(key, "disconnected")
                 changed.append((key, INACCESSIBLE))
         return changed
 
@@ -338,11 +389,20 @@ class RegionCoverageTracker(object):
             return EXPLORING
         return state.status
 
+    def _unresolved(self, state):
+        return state.status in (EXPLORING, DEFERRED) or (
+            state.inaccessible_reason != "disconnected"
+            and (
+                state.frontier_points >= self.open_frontier_points
+                or self._has_coverage_gap(state)
+            )
+        )
+
     def unresolved_count(self, regions=None, now_s=None):
         allowed = None if regions is None else set(regions)
         return sum(
             (allowed is None or key in allowed)
-            and self.status(key, now_s) in (EXPLORING, DEFERRED)
+            and self._unresolved(state)
             for key, state in self.regions.items()
         )
 

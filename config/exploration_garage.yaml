@@ -50,6 +50,8 @@ blocked_subgoal_memory_s: 60.0
 # Path length is a cost. Heading is only a weak tie breaker.
 frontier_distance_reward: -0.05
 frontier_heading_reward: 0.30
+# Optional scoring variant for paired pilots.
+frontier_gain_rate_selection: false
 active_goal_min_hold_s: 2.0
 active_goal_reached_m: 1.20
 active_goal_stall_s: 12.0
@@ -160,6 +162,9 @@ completion_stable_audits: 3
 completion_search_range_m: 200.0
 completion_max_search_nodes: 160000
 completion_min_reachable_cells: 100
+reachability_recovery_timeout_s: 45.0
+reachability_recovery_attempts: 3
+coverage_stall_timeout_s: 90.0
 no_frontier_finish_s: 20.0
 minimum_exploration_s: 120.0
 max_exploration_s: 3600.0

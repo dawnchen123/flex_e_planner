@@ -14,6 +14,7 @@
   <arg name="decision_trace_path" default=""/>
 
   <include file="$(find local_planner)/launch/local_planner.launch">
+    <arg name="motionGoalTopic" value="/flex_e/motion_goal"/>
     <arg name="maxSpeed" value="$(arg maxSpeed)"/>
     <arg name="autonomySpeed" value="$(arg autonomySpeed)"/>
     <arg name="goalX" value="$(arg vehicleX)"/>
